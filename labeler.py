@@ -100,6 +100,59 @@ def _get_item_text(item):
     return str(item)
 
 
+def _render_table_html(item):
+    """
+    Convert a docling TableItem's cell grid to an HTML table with proper
+    colspan/rowspan so merged cells are visible in the labeler.
+    Returns an HTML string, or empty string if unavailable.
+    """
+    try:
+        grid = item.data.grid
+        if not grid:
+            return ""
+
+        rendered_cells: set = set()
+        rows_html = []
+
+        for row_idx, row in enumerate(grid):
+            cells_html = []
+            for col_idx, cell in enumerate(row):
+                if (row_idx, col_idx) in rendered_cells:
+                    continue
+
+                rs = max(1, int(getattr(cell, "row_span", 1) or 1))
+                cs = max(1, int(getattr(cell, "col_span", 1) or 1))
+
+                for r in range(row_idx, row_idx + rs):
+                    for c in range(col_idx, col_idx + cs):
+                        rendered_cells.add((r, c))
+
+                is_header = bool(
+                    getattr(cell, "column_header", False)
+                    or getattr(cell, "row_header", False)
+                )
+                tag = "th" if is_header else "td"
+                attrs = ""
+                if rs > 1:
+                    attrs += f' rowspan="{rs}"'
+                if cs > 1:
+                    attrs += f' colspan="{cs}"'
+
+                text = str(getattr(cell, "text", "") or "")
+                text = (
+                    text.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                )
+                cells_html.append(f"<{tag}{attrs}>{text}</{tag}>")
+
+            rows_html.append("<tr>" + "".join(cells_html) + "</tr>")
+
+        return "<table>" + "".join(rows_html) + "</table>"
+    except Exception:
+        return ""
+
+
 def _bbox_to_norm(bbox, page_width, page_height):
     """
     Convert a docling BoundingBox to normalised (0-1) top-left-origin coords.
@@ -213,6 +266,11 @@ def process_with_docling(pdf_path):
                 "content": content,
                 "bbox_norm": bbox_norm,
             }
+            # For table items include the structured cell grid as HTML
+            if label == "table":
+                thtml = _render_table_html(item)
+                if thtml:
+                    element["table_html"] = thtml
             elements_by_page.setdefault(page_no, []).append(element)
 
     return elements_by_page, page_dims
@@ -308,7 +366,17 @@ def save_annotations():
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     total = sum(len(e) for e in pages_data.values())
-    return jsonify({"success": True, "saved_to": output_path, "num_elements": total})
+    # Provide both full path and a short relative path for display
+    try:
+        rel_path = os.path.relpath(output_path, BASE_DIR)
+    except ValueError:
+        rel_path = output_path
+    return jsonify({
+        "success": True,
+        "saved_to": output_path,
+        "saved_to_rel": rel_path,
+        "num_elements": total,
+    })
 
 
 @app.route("/list_annotations")

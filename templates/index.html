@@ -172,14 +172,20 @@
 
   .element-item {
     border: 1px solid var(--border);
+    border-left: 3px solid transparent;
     border-radius: var(--radius);
     padding: 8px 10px;
     cursor: pointer;
-    transition: border-color .15s, background .15s;
+    transition: border-color .15s, background .15s, box-shadow .15s;
     font-size: .8rem;
   }
-  .element-item:hover { background: var(--bg); }
-  .element-item.selected { border-color: var(--accent); background: #2a1a2a; }
+  .element-item:hover { background: var(--bg); border-left-color: var(--text2); }
+  .element-item.selected {
+    border-color: var(--accent);
+    border-left: 4px solid var(--accent);
+    background: #3a0a24;
+    box-shadow: 0 0 0 1px var(--accent) inset, 0 2px 12px rgba(233,69,96,.25);
+  }
 
   .el-label {
     display: inline-block;
@@ -237,6 +243,88 @@
   /* Save area */
   #save-area { padding: 12px; border-top: 1px solid var(--border); flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
   #save-area .btn { width: 100%; }
+  #save-path-info {
+    font-size: .72rem;
+    color: var(--text2);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 6px 8px;
+    display: none;
+    word-break: break-all;
+    line-height: 1.5;
+  }
+  #save-path-info strong { color: var(--success); display: block; margin-bottom: 2px; }
+  #save-path-info .copy-btn {
+    display: inline-block;
+    margin-top: 4px;
+    padding: 2px 8px;
+    border-radius: 3px;
+    background: var(--surface2);
+    color: var(--text);
+    border: none;
+    cursor: pointer;
+    font-size: .72rem;
+  }
+
+  /* Resize handle */
+  #resize-handle {
+    width: 5px;
+    background: var(--border);
+    cursor: col-resize;
+    flex-shrink: 0;
+    transition: background .15s;
+    position: relative;
+    z-index: 10;
+  }
+  #resize-handle:hover, #resize-handle.dragging { background: var(--accent); }
+
+  /* Table preview */
+  #table-preview {
+    display: none;
+    margin-top: 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  #table-preview-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: var(--surface2);
+    font-size: .78rem;
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+  }
+  #table-preview-header:hover { background: var(--accent2); }
+  #table-preview-body {
+    overflow: auto;
+    max-height: 320px;
+    padding: 8px;
+    background: var(--bg);
+  }
+  #table-preview-body table {
+    border-collapse: collapse;
+    font-size: .78rem;
+    color: var(--text);
+    width: 100%;
+  }
+  #table-preview-body th, #table-preview-body td {
+    border: 1px solid var(--border);
+    padding: 4px 7px;
+    white-space: pre-wrap;
+    vertical-align: top;
+  }
+  #table-preview-body th {
+    background: var(--surface2);
+    color: #fff;
+    font-weight: 600;
+  }
+  #table-preview-body td { background: var(--bg); }
+  #table-preview-body tr:nth-child(even) td { background: #16213e55; }
+  .table-preview-empty { color: var(--text2); font-size: .8rem; font-style: italic; }
 
   /* Spinner */
   #spinner {
@@ -336,6 +424,9 @@
     </div>
   </div>
 
+  <!-- Resize handle -->
+  <div id="resize-handle" title="Drag to resize panels"></div>
+
   <!-- Sidebar -->
   <div id="sidebar">
     <div id="sidebar-tabs">
@@ -363,6 +454,16 @@
         <div class="field">
           <label>Content / Text</label>
           <textarea id="edit-content" rows="5"></textarea>
+        </div>
+
+        <!-- Table structure preview (visible for table elements only) -->
+        <div id="table-preview">
+          <div id="table-preview-header" onclick="toggleTablePreview()">
+            📊 Table Structure <span id="table-preview-toggle">▼ show</span>
+          </div>
+          <div id="table-preview-body" style="display:none">
+            <div id="table-preview-content"></div>
+          </div>
         </div>
         <div class="field">
           <label>Bounding Box (normalised 0–1, top-left origin)</label>
@@ -395,6 +496,11 @@
     <div id="save-area">
       <button class="btn btn-success" onclick="saveAnnotations()">💾 Save Annotations (JSON)</button>
       <button class="btn btn-warning" onclick="addElement()">➕ Add New Element</button>
+      <div id="save-path-info">
+        <strong>✔ Saved</strong>
+        <span id="save-path-text"></span>
+        <button class="copy-btn" onclick="copyPath()" title="Copy full path" aria-label="Copy full file path to clipboard">📋 Copy path</button>
+      </div>
     </div>
   </div>
 </div>
@@ -694,7 +800,9 @@ canvas.addEventListener('mouseleave', () => {
 });
 
 // ─── Element selection & editing ──────────────────────────────────────────────
-function selectElement(id) {
+function selectElement(id, opts) {
+  // opts: { switchToEdit: bool (default true), scrollList: bool (default true) }
+  const { switchToEdit = true, scrollList = true } = opts || {};
   state.selectedId = id;
   const el = getCurrentPageElement(id);
   if (!el) return;
@@ -702,8 +810,14 @@ function selectElement(id) {
   // Highlight in list
   document.querySelectorAll('.element-item').forEach(li => li.classList.toggle('selected', li.dataset.id === id));
 
+  // Scroll the selected list item into view
+  if (scrollList) {
+    const li = document.querySelector(`.element-item[data-id="${CSS.escape(id)}"]`);
+    if (li) li.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+
   updateEditPanel(el);
-  switchTab('edit');
+  if (switchToEdit) switchTab('edit');
 }
 
 function deselectElement() {
@@ -721,7 +835,9 @@ function updateEditPanel(el) {
   const noSel = document.getElementById('no-selection');
   const form  = document.getElementById('edit-form');
   if (!el) {
-    noSel.style.display = ''; form.style.display = 'none'; return;
+    noSel.style.display = ''; form.style.display = 'none';
+    document.getElementById('table-preview').style.display = 'none';
+    return;
   }
   noSel.style.display = 'none'; form.style.display = '';
 
@@ -735,6 +851,9 @@ function updateEditPanel(el) {
   document.getElementById('bbox-y1').value = b.y1 ?? 0;
   document.getElementById('bbox-x2').value = b.x2 ?? 1;
   document.getElementById('bbox-y2').value = b.y2 ?? 1;
+
+  // Table preview
+  renderTablePreview(el);
 }
 
 function applyEdit() {
@@ -815,7 +934,8 @@ function buildElementsList() {
 document.getElementById('elements-list').addEventListener('click', e => {
   const item = e.target.closest('.element-item');
   if (item && item.dataset.id) {
-    selectElement(item.dataset.id);
+    // Stay on elements tab when clicking from list; don't auto-switch to edit
+    selectElement(item.dataset.id, { switchToEdit: false, scrollList: false });
     renderCanvas();
   }
 });
@@ -868,7 +988,13 @@ async function saveAnnotations() {
     const data = await resp.json();
     hideSpinner();
     if (data.success) {
-      toast(`Saved ${data.num_elements} elements → ${data.saved_to.split('/').pop()}`, 'success');
+      // Show persistent save-path info panel
+      const pathInfo = document.getElementById('save-path-info');
+      const pathText = document.getElementById('save-path-text');
+      state._lastSavedPath = data.saved_to;
+      pathText.textContent = data.saved_to_rel || data.saved_to;
+      pathInfo.style.display = '';
+      toast(`✔ Saved ${data.num_elements} elements`, 'success');
     } else {
       toast('Save failed: ' + (data.error || 'unknown error'), 'error');
     }
@@ -877,6 +1003,104 @@ async function saveAnnotations() {
     toast('Save error: ' + e.message, 'error');
   }
 }
+
+function copyPath() {
+  const path = state._lastSavedPath || '';
+  if (!path) return;
+  navigator.clipboard.writeText(path).then(
+    () => toast('Path copied to clipboard', 'success'),
+    () => toast('Copy failed – see save panel for path', 'error')
+  );
+}
+
+// ─── Table preview ────────────────────────────────────────────────────────────
+function renderTablePreview(el) {
+  const container = document.getElementById('table-preview');
+  const content   = document.getElementById('table-preview-content');
+
+  if (!el || el.label !== 'table') {
+    container.style.display = 'none';
+    return;
+  }
+  container.style.display = '';
+
+  if (el.table_html) {
+    // Backend provided full cell-grid HTML (with colspan/rowspan)
+    content.innerHTML = el.table_html;
+  } else {
+    // Fallback: parse markdown table from content field
+    const html = markdownTableToHtml(el.content || '');
+    if (html) {
+      content.innerHTML = html;
+    } else {
+      content.innerHTML = `<span class="table-preview-empty">No structured table data available.<br>Raw content shown in the textarea above.</span>`;
+    }
+  }
+}
+
+function toggleTablePreview() {
+  const body   = document.getElementById('table-preview-body');
+  const toggle = document.getElementById('table-preview-toggle');
+  const shown  = body.style.display !== 'none';
+  body.style.display = shown ? 'none' : '';
+  toggle.textContent = shown ? '▼ show' : '▲ hide';
+}
+
+function markdownTableToHtml(md) {
+  const lines = md.split('\n').map(l => l.trim()).filter(l => l);
+  if (!lines.length || !lines[0].startsWith('|')) return '';
+
+  let html = '<table>';
+  let headerDone = false;
+
+  for (const line of lines) {
+    if (!line.startsWith('|')) break;
+    // Separator row – matches patterns like |---|---| or |:--|--:|
+    if (/^\|[\s\-:|]+\|$/.test(line)) { headerDone = true; continue; }
+
+    const tag = !headerDone ? 'th' : 'td';
+    const cells = line.split('|').slice(1, -1);
+    html += '<tr>' + cells.map(c => `<${tag}>${escHtml(c.trim())}</${tag}>`).join('') + '</tr>';
+    if (!headerDone) headerDone = true;
+  }
+
+  html += '</table>';
+  return html === '<table></table>' ? '' : html;
+}
+
+// ─── Resizable sidebar divider ────────────────────────────────────────────────
+(function initResizeHandle() {
+  const handle  = document.getElementById('resize-handle');
+  const sidebar = document.getElementById('sidebar');
+  let dragging  = false;
+  let startX, startW;
+
+  handle.addEventListener('mousedown', e => {
+    dragging = true;
+    startX   = e.clientX;
+    startW   = sidebar.getBoundingClientRect().width;
+    handle.classList.add('dragging');
+    document.body.style.cursor    = 'col-resize';
+    document.body.style.userSelect = 'none';
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const delta = startX - e.clientX;   // moving left = bigger sidebar
+    const newW  = Math.max(240, Math.min(700, startW + delta));
+    sidebar.style.width = newW + 'px';
+    if (state.totalPages > 0) { resizeCanvas(); renderCanvas(); }
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    handle.classList.remove('dragging');
+    document.body.style.cursor     = '';
+    document.body.style.userSelect = '';
+  });
+})();
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 buildLegend();
