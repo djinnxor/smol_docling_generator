@@ -1,0 +1,4 @@
+flask>=3.0
+pillow>=10.0
+pdf2image>=1.17
+docling>=2.0

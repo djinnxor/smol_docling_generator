@@ -1,0 +1,15 @@
+# Labeler runtime data (uploads and saved annotations)
+labeler_data/uploads/
+labeler_data/annotations/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# macOS
+.DS_Store
