@@ -21,7 +21,7 @@ class GoogleOCR:
 
         encoded_image = base64.b64encode(content).decode('utf-8')
         if self.api_key:
-            self.vision_api_url += f"?key={self.api_key}"
+            url = f"{self.vision_api_url}?key={self.api_key}"
             headers = {'Content-Type': 'application/json'}
         else:
             url = self.vision_api_url
@@ -44,7 +44,7 @@ class GoogleOCR:
             ]
         }
 
-        response = requests.post(self.vision_api_url, json=request_body, headers=headers)
+        response = requests.post(url, json=request_body, headers=headers)
 
         if response.status_code == 200:
             result = response.json()
