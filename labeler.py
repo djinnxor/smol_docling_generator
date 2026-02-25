@@ -20,6 +20,7 @@ from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from PIL import Image
 from werkzeug.utils import secure_filename
+from google_ocr import GoogleOCR
 
 # Default A4 page dimensions in points (used when docling cannot determine page size)
 A4_WIDTH_POINTS = 595.0
@@ -276,6 +277,52 @@ def process_with_docling(pdf_path):
     return elements_by_page, page_dims
 
 
+def apply_google_ocr_to_elements(elements_by_page, image_paths):
+    """
+    Replace each element's text content with Google Vision OCR output.
+    Crops the element's bounding box from the page image and OCRs the region.
+    Requires the GOOGLE_OCR_API_KEY environment variable to be set.
+    Labels that typically contain no text (e.g. 'picture') are skipped.
+    """
+    api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+    ocr = GoogleOCR(api_key=api_key)
+    skip_labels = {"picture"}
+
+    for page_no, img_path in enumerate(image_paths, 1):
+        page_elements = elements_by_page.get(page_no, [])
+        if not page_elements:
+            continue
+        img = Image.open(img_path)
+        img_w, img_h = img.size
+
+        for el in page_elements:
+            if el.get("label") in skip_labels:
+                continue
+            bbox = el.get("bbox_norm")
+            if not bbox:
+                continue
+            x1 = int(bbox["x1"] * img_w)
+            y1 = int(bbox["y1"] * img_h)
+            x2 = int(bbox["x2"] * img_w)
+            y2 = int(bbox["y2"] * img_h)
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            cropped = img.crop((x1, y1, x2, y2))
+            tmp_path = os.path.join(UPLOAD_FOLDER, f"_crop_{uuid.uuid4().hex}.png")
+            cropped.save(tmp_path, "PNG")
+            try:
+                text = ocr.google_vision_ocr(tmp_path)
+                if text.strip():
+                    el["content"] = text.strip()
+            except Exception:
+                pass
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+    return elements_by_page
+
+
 # ---------------------------------------------------------------------------
 # Flask routes
 # ---------------------------------------------------------------------------
@@ -315,6 +362,14 @@ def process_pdf():
     except Exception as e:
         docling_error = str(e)
 
+    # Apply Google OCR to replace docling's built-in OCR text (if API key is set)
+    google_ocr_error = None
+    if os.environ.get("GOOGLE_OCR_API_KEY"):
+        try:
+            elements_by_page = apply_google_ocr_to_elements(elements_by_page, image_paths)
+        except Exception as e:
+            google_ocr_error = str(e)
+
     # Build response
     pages = []
     for i, (img_path, img_size) in enumerate(zip(image_paths, page_sizes), 1):
@@ -333,6 +388,8 @@ def process_pdf():
     }
     if docling_error:
         resp["docling_warning"] = f"Docling processing failed: {docling_error}"
+    if google_ocr_error:
+        resp["google_ocr_warning"] = f"Google OCR failed: {google_ocr_error}"
 
     return jsonify(resp)
 
@@ -349,33 +406,54 @@ def save_annotations():
     if not data:
         return jsonify({"error": "No data provided"}), 400
 
-    raw_name = data.get("filename", "annotations")
-    filename = secure_filename(re.sub(r"[^\w\-.]", "_", raw_name)) or "annotations"
     pages_data = data.get("pages", {})
+    saved_files = []
+    total_elements = 0
 
-    output = {
-        "filename": filename,
-        "pages": [
-            {"page": int(p), "elements": elems}
-            for p, elems in sorted(pages_data.items(), key=lambda x: int(x[0]))
-        ],
-    }
+    for p, page_info in sorted(pages_data.items(), key=lambda x: int(x[0])):
+        # Support both new format {image_name, width, height, elements} and legacy list format
+        if isinstance(page_info, list):
+            elements = page_info
+            image_name = f"page_{p}"
+            width = 0
+            height = 0
+        else:
+            elements = page_info.get("elements", [])
+            image_name = page_info.get("image_name", f"page_{p}")
+            width = page_info.get("width", 0)
+            height = page_info.get("height", 0)
 
-    output_path = os.path.join(ANNOTATIONS_FOLDER, f"{filename}_annotations.json")
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False, indent=2)
+        safe_image_name = secure_filename(re.sub(r"[^\w\-.]", "_", image_name)) or f"page_{p}"
 
-    total = sum(len(e) for e in pages_data.values())
-    # Provide both full path and a short relative path for display
+        page_output = {
+            "image_name": safe_image_name,
+            "width": width,
+            "height": height,
+            "elements": elements,
+        }
+
+        output_path = os.path.join(ANNOTATIONS_FOLDER, f"{safe_image_name}_annotations.json")
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(page_output, f, ensure_ascii=False, indent=2)
+
+        saved_files.append(output_path)
+        total_elements += len(elements)
+
+    if not saved_files:
+        return jsonify({"error": "No pages to save"}), 400
+
     try:
-        rel_path = os.path.relpath(output_path, BASE_DIR)
+        rel_dir = os.path.relpath(ANNOTATIONS_FOLDER, BASE_DIR)
     except ValueError:
-        rel_path = output_path
+        rel_dir = ANNOTATIONS_FOLDER
+
     return jsonify({
         "success": True,
-        "saved_to": output_path,
-        "saved_to_rel": rel_path,
-        "num_elements": total,
+        "saved_to": saved_files[0],
+        "saved_to_rel": rel_dir,
+        "saved_files": [os.path.basename(f) for f in saved_files],
+        "num_elements": total_elements,
+        "num_pages": len(saved_files),
     })
 
 

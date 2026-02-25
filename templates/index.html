@@ -530,6 +530,7 @@ let state = {
   drawStart: null,
   imgNaturalW: 0,
   imgNaturalH: 0,
+  pageDims: {},
 };
 
 // ─── DOM refs ─────────────────────────────────────────────────────────────────
@@ -599,6 +600,7 @@ async function processPDF() {
 
     if (data.error) { toast(data.error, 'error'); setStatus(data.error, 'error'); return; }
     if (data.docling_warning) toast('⚠ ' + data.docling_warning, '');
+    if (data.google_ocr_warning) toast('⚠ ' + data.google_ocr_warning, '');
 
     // Populate state
     state.filename  = data.filename;
@@ -609,6 +611,10 @@ async function processPDF() {
     // Store page image URLs
     state.pageImages = {};
     data.pages.forEach(p => { state.pageImages[p.page_num] = p.image_url; });
+
+    // Store page dimensions
+    state.pageDims = {};
+    data.pages.forEach(p => { state.pageDims[p.page_num] = { width: p.width, height: p.height }; });
 
     document.getElementById('btn-prev').disabled = false;
     document.getElementById('btn-next').disabled = false;
@@ -978,12 +984,26 @@ function updateStats() {
 async function saveAnnotations() {
   if (!state.filename) { toast('No document loaded.', 'error'); return; }
 
+  // Build per-page payload with image name and dimensions
+  const pagesPayload = {};
+  Object.keys(state.pages).forEach(pageNum => {
+    const imgUrl = state.pageImages[pageNum] || '';
+    const imgName = imgUrl.replace(/^.*\//, '').replace(/\.[^.]+$/, '');
+    const dims = state.pageDims[pageNum] || {};
+    pagesPayload[pageNum] = {
+      image_name: imgName,
+      width: dims.width || 0,
+      height: dims.height || 0,
+      elements: state.pages[pageNum] || [],
+    };
+  });
+
   showSpinner('Saving annotations…');
   try {
     const resp = await fetch('/save_annotations', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename: state.filename, pages: state.pages }),
+      body: JSON.stringify({ filename: state.filename, pages: pagesPayload }),
     });
     const data = await resp.json();
     hideSpinner();
@@ -994,7 +1014,8 @@ async function saveAnnotations() {
       state._lastSavedPath = data.saved_to;
       pathText.textContent = data.saved_to_rel || data.saved_to;
       pathInfo.style.display = '';
-      toast(`✔ Saved ${data.num_elements} elements`, 'success');
+      const pageCount = data.num_pages || 1;
+      toast(`✔ Saved ${data.num_elements} elements (${pageCount} page file${pageCount > 1 ? 's' : ''})`, 'success');
     } else {
       toast('Save failed: ' + (data.error || 'unknown error'), 'error');
     }
