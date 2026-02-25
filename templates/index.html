@@ -83,6 +83,42 @@
   #status-bar.error { color: #f44336; }
   #status-bar.ok { color: var(--success); }
 
+  #ocr-model-select {
+    width: auto;
+    padding: 6px 10px;
+    font-size: .82rem;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    cursor: pointer;
+  }
+  #ocr-model-select:focus { border-color: var(--accent); }
+
+  #removed-overlay {
+    position: absolute;
+    inset: 0;
+    background: rgba(244,67,54,.15);
+    border: 3px dashed #f44336;
+    pointer-events: none;
+    display: none;
+    z-index: 5;
+  }
+  #removed-overlay span {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: #f44336cc;
+    color: #fff;
+    font-size: 1.4rem;
+    font-weight: 700;
+    padding: 12px 28px;
+    border-radius: var(--radius);
+    letter-spacing: .05em;
+    pointer-events: none;
+  }
+
   /* ── Main layout ─────────────────────────────────────────────── */
   #main {
     display: flex;
@@ -405,6 +441,11 @@
     <input type="file" id="pdf-input" accept=".pdf" />
   </label>
   <button class="btn btn-primary" id="btn-process" onclick="processPDF()" disabled>⚡ Process with Docling</button>
+  <select id="ocr-model-select" title="OCR model to use for text extraction">
+    <option value="none">No OCR Override</option>
+    <option value="google">Google Vision OCR</option>
+    <option value="rapidocr">Docling OCR (RapidOCR)</option>
+  </select>
   <span id="status-bar">No file loaded</span>
 </div>
 
@@ -417,6 +458,9 @@
       <button class="btn btn-secondary" onclick="changePage(-1)" id="btn-prev" disabled>◀ Prev</button>
       <span id="page-info">—</span>
       <button class="btn btn-secondary" onclick="changePage(1)" id="btn-next" disabled>Next ▶</button>
+      <button class="btn btn-danger" onclick="removePage()" id="btn-remove-page" disabled title="Remove current page from annotations">🗑 Remove Page</button>
+      <button class="btn btn-secondary" onclick="restorePage()" id="btn-restore-page" style="display:none" title="Restore removed page">↩ Restore Page</button>
+      <button class="btn btn-secondary" onclick="redetectTables()" id="btn-redetect" disabled title="Re-run table detection on current page">🔍 Re-detect Tables</button>
       <div id="mode-buttons">
         <button class="mode-btn active" id="mode-select" onclick="setMode('select')" title="Select mode (click to pick an element)">↖ Select</button>
         <button class="mode-btn" id="mode-draw" onclick="setMode('draw')" title="Draw mode (drag to create new element)">✏️ Draw</button>
@@ -427,6 +471,7 @@
       <div id="canvas-container">
         <img id="page-img" src="" alt="" />
         <canvas id="overlay-canvas"></canvas>
+        <div id="removed-overlay"><span>PAGE REMOVED</span></div>
         <div id="empty-state">
           <div class="big-icon">📄</div>
           <p>Open a PDF and click <strong>Process with Docling</strong> to start labeling.</p>
@@ -506,6 +551,7 @@
     <!-- Save area -->
     <div id="save-area">
       <button class="btn btn-success" onclick="saveAnnotations()">💾 Save Annotations (JSON)</button>
+      <button class="btn btn-secondary" onclick="exportXML()">📄 Export Annotations (XML)</button>
       <button class="btn btn-warning" onclick="addElement()">➕ Add New Element</button>
       <div id="save-path-info">
         <strong>✔ Saved</strong>
@@ -532,7 +578,9 @@ const ALL_TAGS   = {{ tags | tojson }};
 
 let state = {
   filename: '',
+  pdfFilename: '',   // actual saved PDF filename for re-detection
   pages: {},          // { pageNum: [ element, ... ] }
+  removedPages: new Set(),  // page numbers excluded from save/export
   currentPage: 1,
   totalPages: 0,
   selectedId: null,
@@ -605,6 +653,7 @@ async function processPDF() {
   showSpinner('Converting PDF and running Docling…');
   const formData = new FormData();
   formData.append('file', fileInput.files[0]);
+  formData.append('ocr_model', document.getElementById('ocr-model-select').value);
 
   try {
     const resp = await fetch('/process', { method: 'POST', body: formData });
@@ -613,12 +662,14 @@ async function processPDF() {
 
     if (data.error) { toast(data.error, 'error'); setStatus(data.error, 'error'); return; }
     if (data.docling_warning) toast('⚠ ' + data.docling_warning, '');
-    if (data.google_ocr_warning) toast('⚠ ' + data.google_ocr_warning, '');
+    if (data.ocr_warning) toast('⚠ ' + data.ocr_warning, '');
 
     // Populate state
-    state.filename  = data.filename;
-    state.totalPages = data.num_pages;
+    state.filename    = data.filename;
+    state.pdfFilename = data.pdf_filename || '';
+    state.totalPages  = data.num_pages;
     state.pages = {};
+    state.removedPages = new Set();
     data.pages.forEach(p => { state.pages[p.page_num] = p.elements || []; });
 
     // Store page image URLs
@@ -631,6 +682,8 @@ async function processPDF() {
 
     document.getElementById('btn-prev').disabled = false;
     document.getElementById('btn-next').disabled = false;
+    document.getElementById('btn-remove-page').disabled = false;
+    document.getElementById('btn-redetect').disabled = false;
     emptyState.style.display = 'none';
 
     const total = Object.values(state.pages).reduce((s, a) => s + a.length, 0);
@@ -654,9 +707,13 @@ function loadPage(n) {
   state.selectedId = null;
   updateEditPanel();
 
-  document.getElementById('page-info').textContent = `Page ${n} / ${state.totalPages}`;
+  const removed = state.removedPages.has(n);
+  document.getElementById('page-info').textContent = `Page ${n} / ${state.totalPages}${removed ? ' 🗑' : ''}`;
   document.getElementById('btn-prev').disabled = n <= 1;
   document.getElementById('btn-next').disabled = n >= state.totalPages;
+  document.getElementById('btn-remove-page').style.display = removed ? 'none' : '';
+  document.getElementById('btn-restore-page').style.display = removed ? '' : 'none';
+  document.getElementById('removed-overlay').style.display = removed ? '' : 'none';
 
   const url = state.pageImages[n];
   pageImg.onload = () => {
@@ -726,6 +783,9 @@ function drawElement(el, selected) {
   ctx.fillStyle = '#fff';
   ctx.fillText(label, x + 3, y - 3);
 
+  // Table cell borders
+  if (el.label === 'table') drawTableGrid(el, x, y, w, h, color);
+
   // Corner resize handles (selected elements only)
   if (selected) {
     const handles = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]];
@@ -738,6 +798,53 @@ function drawElement(el, selected) {
     });
   }
 
+  ctx.restore();
+}
+
+// ─── Table grid overlay ───────────────────────────────────────────────────────
+function drawTableGrid(el, x, y, w, h, color) {
+  // Prefer per-cell bounding boxes from docling when available
+  if (el.table_cells && el.table_cells.length) {
+    ctx.save();
+    ctx.strokeStyle = color + 'cc';
+    ctx.lineWidth = 0.8;
+    el.table_cells.forEach(cell => {
+      const { x: cx, y: cy, w: cw, h: ch } = normToCanvas(cell.bbox_norm);
+      ctx.strokeRect(cx, cy, cw, ch);
+    });
+    ctx.restore();
+    return;
+  }
+
+  // Fallback: draw an equally-spaced grid based on row/col counts from table_html
+  if (!el.table_html) return;
+  const tmp = document.createElement('div');
+  tmp.innerHTML = el.table_html;
+  const rows = tmp.querySelectorAll('tr');
+  if (!rows.length) return;
+  const numRows = rows.length;
+  let numCols = 0;
+  rows.forEach(row => {
+    let cols = 0;
+    row.querySelectorAll('td,th').forEach(cell => {
+      cols += parseInt(cell.getAttribute('colspan') || 1);
+    });
+    numCols = Math.max(numCols, cols);
+  });
+  if (numCols < 1) return;
+
+  ctx.save();
+  ctx.strokeStyle = color + 'aa';
+  ctx.lineWidth = 0.8;
+  ctx.setLineDash([]);
+  for (let r = 1; r < numRows; r++) {
+    const ry = y + h * r / numRows;
+    ctx.beginPath(); ctx.moveTo(x, ry); ctx.lineTo(x + w, ry); ctx.stroke();
+  }
+  for (let c = 1; c < numCols; c++) {
+    const rx = x + w * c / numCols;
+    ctx.beginPath(); ctx.moveTo(rx, y); ctx.lineTo(rx, y + h); ctx.stroke();
+  }
   ctx.restore();
 }
 
@@ -1124,9 +1231,10 @@ function updateStats() {
 async function saveAnnotations() {
   if (!state.filename) { toast('No document loaded.', 'error'); return; }
 
-  // Build per-page payload with image name and dimensions
+  // Build per-page payload with image name and dimensions (skip removed pages)
   const pagesPayload = {};
   Object.keys(state.pages).forEach(pageNum => {
+    if (state.removedPages.has(parseInt(pageNum))) return;
     const imgUrl = state.pageImages[pageNum] || '';
     const imgName = imgUrl.replace(/^.*\//, '').replace(/\.[^.]+$/, '');
     const dims = state.pageDims[pageNum] || {};
@@ -1227,6 +1335,121 @@ function markdownTableToHtml(md) {
 
   html += '</table>';
   return html === '<table></table>' ? '' : html;
+}
+
+// ─── Page remove / restore ────────────────────────────────────────────────────
+function removePage() {
+  if (!state.totalPages) return;
+  const page = state.currentPage;
+  state.removedPages.add(page);
+  toast(`Page ${page} marked as removed (excluded from save/export).`, 'success');
+  loadPage(page);  // reload to show removed overlay
+  updateStats();
+}
+
+function restorePage() {
+  if (!state.totalPages) return;
+  const page = state.currentPage;
+  state.removedPages.delete(page);
+  toast(`Page ${page} restored.`, 'success');
+  loadPage(page);
+  updateStats();
+}
+
+// ─── Export XML ───────────────────────────────────────────────────────────────
+async function exportXML() {
+  if (!state.filename) { toast('No document loaded.', 'error'); return; }
+
+  const pagesPayload = {};
+  Object.keys(state.pages).forEach(pageNum => {
+    if (state.removedPages.has(parseInt(pageNum))) return;
+    const imgUrl = state.pageImages[pageNum] || '';
+    const imgName = imgUrl.replace(/^.*\//, '').replace(/\.[^.]+$/, '');
+    const dims = state.pageDims[pageNum] || {};
+    pagesPayload[pageNum] = {
+      image_name: imgName,
+      width: dims.width || 0,
+      height: dims.height || 0,
+      elements: state.pages[pageNum] || [],
+    };
+  });
+
+  showSpinner('Generating XML…');
+  try {
+    const resp = await fetch('/export_xml', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename: state.filename, pages: pagesPayload }),
+    });
+    if (!resp.ok) {
+      const d = await resp.json().catch(() => ({}));
+      toast('Export failed: ' + (d.error || resp.statusText), 'error');
+      return;
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (state.filename || 'document') + '_annotations.xml';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    toast('XML exported successfully!', 'success');
+  } catch(e) {
+    toast('Export error: ' + e.message, 'error');
+  } finally {
+    hideSpinner();
+  }
+}
+
+// ─── Table re-detection ───────────────────────────────────────────────────────
+function bboxOverlap(a, b) {
+  if (!a || !b) return 0;
+  const ix1 = Math.max(a.x1, b.x1), iy1 = Math.max(a.y1, b.y1);
+  const ix2 = Math.min(a.x2, b.x2), iy2 = Math.min(a.y2, b.y2);
+  if (ix2 <= ix1 || iy2 <= iy1) return 0;
+  const inter = (ix2 - ix1) * (iy2 - iy1);
+  const aArea = (a.x2 - a.x1) * (a.y2 - a.y1);
+  const bArea = (b.x2 - b.x1) * (b.y2 - b.y1);
+  return inter / Math.min(aArea || 1, bArea || 1);
+}
+
+async function redetectTables() {
+  if (!state.totalPages || !state.pdfFilename) { toast('Load a PDF first.', 'error'); return; }
+
+  showSpinner(`Re-detecting tables on page ${state.currentPage}…`);
+  try {
+    const resp = await fetch('/redetect_tables', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pdf_filename: state.pdfFilename, page_no: state.currentPage }),
+    });
+    const data = await resp.json();
+    if (data.error) { toast(data.error, 'error'); return; }
+
+    const newTables = data.tables || [];
+    if (!newTables.length) { toast('No new tables detected on this page.', ''); return; }
+
+    const existing = state.pages[state.currentPage] || [];
+    let added = 0;
+    for (const t of newTables) {
+      const overlaps = existing.some(e =>
+        e.label === 'table' && bboxOverlap(e.bbox_norm, t.bbox_norm) > 0.5
+      );
+      if (!overlaps) { existing.push(t); added++; }
+    }
+    state.pages[state.currentPage] = existing;
+
+    renderCanvas();
+    buildElementsList();
+    updateStats();
+    toast(`Re-detection: ${added} new table${added !== 1 ? 's' : ''} added.`, added ? 'success' : '');
+  } catch(e) {
+    toast('Error: ' + e.message, 'error');
+  } finally {
+    hideSpinner();
+  }
 }
 
 // ─── Resizable sidebar divider ────────────────────────────────────────────────
