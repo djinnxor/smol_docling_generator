@@ -7,7 +7,7 @@ import mlx
 # Disable GPU for MLX/ML frameworks (if supported)
 # os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
-source = "tables.pdf"  # document per local path or URL
+source = "tables2.pdf"  # document per local path or URL
 converter = DocumentConverter(allowed_formats=["pdf"])
 start_time = time.time()
 result = converter.convert(source)
@@ -49,3 +49,9 @@ with open("output_doctags.json", "w", encoding="utf-8") as f:
     json.dump(doctags_data, f, ensure_ascii=False, indent=2)
 
 print("Exported structured DocTags to output_doctags.json")
+
+types = sorted({d["type"] for d in doctags_data["doctags"] if d.get("type")})
+print(f"Unique Docling element classes in this document: {len(types)}")
+print("Types:")
+for t in types:
+    print(" -", t)
