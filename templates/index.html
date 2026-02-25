@@ -235,6 +235,17 @@
   #legend { display: flex; flex-direction: column; gap: 5px; }
   .legend-row { display: flex; align-items: center; gap: 8px; font-size: .8rem; }
   .legend-color { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+  .legend-section-header {
+    font-size: .7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--text2);
+    padding: 8px 0 3px;
+    border-bottom: 1px solid var(--border);
+    margin-top: 4px;
+  }
+  .legend-section-header:first-child { padding-top: 2px; margin-top: 0; }
 
   /* Stats */
   #stats-content { font-size: .82rem; color: var(--text2); line-height: 1.8; }
@@ -528,6 +539,8 @@ let state = {
   mode: 'select',     // 'select' | 'draw'
   drawing: false,
   drawStart: null,
+  resizing: false,
+  resizeCorner: null, // 'nw'|'ne'|'sw'|'se'
   imgNaturalW: 0,
   imgNaturalH: 0,
   pageDims: {},
@@ -712,12 +725,44 @@ function drawElement(el, selected) {
   ctx.fillRect(x, y - th, tw, th);
   ctx.fillStyle = '#fff';
   ctx.fillText(label, x + 3, y - 3);
+
+  // Corner resize handles (selected elements only)
+  if (selected) {
+    const handles = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]];
+    ctx.fillStyle = '#fff';
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    handles.forEach(([hx, hy]) => {
+      ctx.fillRect(hx - 4, hy - 4, 8, 8);
+      ctx.strokeRect(hx - 4, hy - 4, 8, 8);
+    });
+  }
+
   ctx.restore();
 }
 
 // ─── Hit-testing ──────────────────────────────────────────────────────────────
 function canvasToNorm(cx, cy) {
   return { x: cx / canvas.width, y: cy / canvas.height };
+}
+
+// ─── Resize helpers ───────────────────────────────────────────────────────────
+const RESIZE_HIT_PX = 8;
+const CORNER_CURSORS = { nw: 'nw-resize', ne: 'ne-resize', sw: 'sw-resize', se: 'se-resize' };
+
+function getResizeCorner(el, cx, cy) {
+  if (!el || !el.bbox_norm) return null;
+  const { x, y, w, h } = normToCanvas(el.bbox_norm);
+  const corners = [
+    { name: 'nw', px: x,     py: y     },
+    { name: 'ne', px: x + w, py: y     },
+    { name: 'sw', px: x,     py: y + h },
+    { name: 'se', px: x + w, py: y + h },
+  ];
+  for (const c of corners) {
+    if (Math.abs(cx - c.px) <= RESIZE_HIT_PX && Math.abs(cy - c.py) <= RESIZE_HIT_PX) return c.name;
+  }
+  return null;
 }
 
 function getElementAtPoint(nx, ny) {
@@ -737,6 +782,18 @@ canvas.addEventListener('mousedown', e => {
   const { x: nx, y: ny } = canvasToNorm(cx, cy);
 
   if (state.mode === 'select') {
+    // Check for corner resize handle on the currently selected element first
+    if (state.selectedId) {
+      const selEl = getCurrentPageElement(state.selectedId);
+      const corner = getResizeCorner(selEl, cx, cy);
+      if (corner) {
+        state.resizing = true;
+        state.resizeCorner = corner;
+        canvas.style.cursor = CORNER_CURSORS[corner];
+        e.preventDefault();
+        return;
+      }
+    }
     const el = getElementAtPoint(nx, ny);
     if (el) selectElement(el.id);
     else deselectElement();
@@ -749,10 +806,43 @@ canvas.addEventListener('mousedown', e => {
 });
 
 canvas.addEventListener('mousemove', e => {
-  if (!state.drawing) return;
   const rect = canvas.getBoundingClientRect();
   const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
   const { x: nx, y: ny } = canvasToNorm(cx, cy);
+
+  // ── Resize in progress ──────────────────────────────────────────────────────
+  if (state.resizing) {
+    const el = getCurrentPageElement(state.selectedId);
+    if (el && el.bbox_norm) {
+      const b = { ...el.bbox_norm };
+      if (state.resizeCorner === 'nw')      { b.x1 = nx; b.y1 = ny; }
+      else if (state.resizeCorner === 'ne') { b.x2 = nx; b.y1 = ny; }
+      else if (state.resizeCorner === 'sw') { b.x1 = nx; b.y2 = ny; }
+      else if (state.resizeCorner === 'se') { b.x2 = nx; b.y2 = ny; }
+      el.bbox_norm = {
+        x1: Math.max(0, Math.min(1, Math.min(b.x1, b.x2))),
+        y1: Math.max(0, Math.min(1, Math.min(b.y1, b.y2))),
+        x2: Math.max(0, Math.min(1, Math.max(b.x1, b.x2))),
+        y2: Math.max(0, Math.min(1, Math.max(b.y1, b.y2))),
+      };
+      renderCanvas();
+      // Update bbox fields without rebuilding the whole form
+      document.getElementById('bbox-x1').value = el.bbox_norm.x1;
+      document.getElementById('bbox-y1').value = el.bbox_norm.y1;
+      document.getElementById('bbox-x2').value = el.bbox_norm.x2;
+      document.getElementById('bbox-y2').value = el.bbox_norm.y2;
+    }
+    return;
+  }
+
+  // ── Cursor update in select mode ─────────────────────────────────────────────
+  if (state.mode === 'select' && state.selectedId) {
+    const selEl = getCurrentPageElement(state.selectedId);
+    const corner = getResizeCorner(selEl, cx, cy);
+    canvas.style.cursor = corner ? CORNER_CURSORS[corner] : 'default';
+  }
+
+  if (!state.drawing) return;
 
   renderCanvas();
   // Draw preview rect
@@ -769,6 +859,19 @@ canvas.addEventListener('mousemove', e => {
 });
 
 canvas.addEventListener('mouseup', e => {
+  // ── Commit resize ────────────────────────────────────────────────────────────
+  if (state.resizing) {
+    state.resizing = false;
+    state.resizeCorner = null;
+    canvas.style.cursor = state.mode === 'draw' ? 'crosshair' : 'default';
+    const el = getCurrentPageElement(state.selectedId);
+    if (el) updateEditPanel(el);
+    buildElementsList();
+    updateStats();
+    renderCanvas();
+    return;
+  }
+
   if (!state.drawing) return;
   state.drawing = false;
 
@@ -802,6 +905,14 @@ canvas.addEventListener('mouseup', e => {
 });
 
 canvas.addEventListener('mouseleave', () => {
+  if (state.resizing) {
+    state.resizing = false;
+    state.resizeCorner = null;
+    canvas.style.cursor = state.mode === 'draw' ? 'crosshair' : 'default';
+    const el = getCurrentPageElement(state.selectedId);
+    if (el) updateEditPanel(el);
+    renderCanvas();
+  }
   if (state.drawing) { state.drawing = false; renderCanvas(); }
 });
 
@@ -847,9 +958,18 @@ function updateEditPanel(el) {
   }
   noSel.style.display = 'none'; form.style.display = '';
 
-  // Populate label select
+  // Populate label select with grouped optgroups
   const sel = document.getElementById('edit-label');
-  sel.innerHTML = ALL_TAGS.map(t => `<option value="${t}"${t===el.label?' selected':''}>${t}</option>`).join('');
+  const coveredTags2 = TAG_GROUPS.flatMap(g => g.tags);
+  const remaining2   = ALL_TAGS.filter(t => !coveredTags2.includes(t));
+  const selGroups = remaining2.length
+    ? [...TAG_GROUPS, { header: 'Other', tags: remaining2 }]
+    : TAG_GROUPS;
+  sel.innerHTML = selGroups.map(g => {
+    const opts = g.tags.filter(t => ALL_TAGS.includes(t));
+    if (!opts.length) return '';
+    return `<optgroup label="${g.header}">${opts.map(t => `<option value="${t}"${t === el.label ? ' selected' : ''}>${t}</option>`).join('')}</optgroup>`;
+  }).join('');
 
   document.getElementById('edit-content').value = el.content || '';
   const b = el.bbox_norm || {};
@@ -947,11 +1067,31 @@ document.getElementById('elements-list').addEventListener('click', e => {
 });
 
 // ─── Legend ───────────────────────────────────────────────────────────────────
+const TAG_GROUPS = [
+  { header: 'Section Headers', tags: ['section_header_level_1', 'section_header_level_2', 'section_header_level_3'] },
+  { header: 'Text Content',    tags: ['text', 'list_item', 'caption', 'footnote', 'code'] },
+  { header: 'Document',        tags: ['title', 'formula'] },
+  { header: 'Visual',          tags: ['picture', 'table'] },
+  { header: 'Page Layout',     tags: ['page_header', 'page_footer'] },
+];
+
 function buildLegend() {
   const lg = document.getElementById('legend');
-  lg.innerHTML = ALL_TAGS.map(t => {
-    const c = TAG_COLORS[t] || '#aaa';
-    return `<div class="legend-row"><div class="legend-color" style="background:${c}"></div><span>${t}</span></div>`;
+  const coveredTags = TAG_GROUPS.flatMap(g => g.tags);
+  const remaining   = ALL_TAGS.filter(t => !coveredTags.includes(t));
+  const groups = remaining.length
+    ? [...TAG_GROUPS, { header: 'Other', tags: remaining }]
+    : TAG_GROUPS;
+
+  lg.innerHTML = groups.map(g => {
+    const tagsInGroup = g.tags.filter(t => ALL_TAGS.includes(t));
+    if (!tagsInGroup.length) return '';
+    const header = `<div class="legend-section-header">${g.header}</div>`;
+    const rows = tagsInGroup.map(t => {
+      const c = TAG_COLORS[t] || '#aaa';
+      return `<div class="legend-row"><div class="legend-color" style="background:${c}"></div><span>${t}</span></div>`;
+    }).join('');
+    return header + rows;
   }).join('');
 }
 
