@@ -393,7 +393,11 @@
     📂 Open PDF
     <input type="file" id="pdf-input" accept=".pdf" />
   </label>
-  <button class="btn btn-primary" id="btn-process" onclick="processPDF()" disabled>⚡ Process with Docling</button>
+  <select id="ocr-mode" title="Choose OCR engine" style="padding:5px 10px;border-radius:var(--radius);background:var(--surface2);color:var(--text);border:1px solid var(--border);font-size:.85rem;cursor:pointer;">
+    <option value="docling">🔍 Docling Built-in OCR</option>
+    <option value="google">🌐 Google OCR</option>
+  </select>
+  <button class="btn btn-primary" id="btn-process" onclick="processPDF()" disabled>⚡ Process</button>
   <span id="status-bar">No file loaded</span>
 </div>
 
@@ -418,7 +422,7 @@
         <canvas id="overlay-canvas"></canvas>
         <div id="empty-state">
           <div class="big-icon">📄</div>
-          <p>Open a PDF and click <strong>Process with Docling</strong> to start labeling.</p>
+          <p>Open a PDF, choose an OCR engine, and click <strong>Process</strong> to start labeling.</p>
         </div>
       </div>
     </div>
@@ -589,9 +593,14 @@ async function processPDF() {
     toast('Please select a PDF file first.', 'error'); return;
   }
 
-  showSpinner('Converting PDF and running Docling…');
+  const ocrMode = document.getElementById('ocr-mode').value;
+  const spinnerMsg = ocrMode === 'google'
+    ? 'Converting PDF and running Google OCR…'
+    : 'Converting PDF and running Docling…';
+  showSpinner(spinnerMsg);
   const formData = new FormData();
   formData.append('file', fileInput.files[0]);
+  formData.append('ocr_mode', ocrMode);
 
   try {
     const resp = await fetch('/process', { method: 'POST', body: formData });

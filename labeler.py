@@ -362,13 +362,17 @@ def process_pdf():
     except Exception as e:
         docling_error = str(e)
 
-    # Apply Google OCR to replace docling's built-in OCR text (if API key is set)
+    # Apply Google OCR when explicitly requested via the ocr_mode parameter
+    ocr_mode = request.form.get("ocr_mode", "docling")
     google_ocr_error = None
-    if os.environ.get("GOOGLE_OCR_API_KEY"):
-        try:
-            elements_by_page = apply_google_ocr_to_elements(elements_by_page, image_paths)
-        except Exception as e:
-            google_ocr_error = str(e)
+    if ocr_mode == "google":
+        if not os.environ.get("GOOGLE_OCR_API_KEY"):
+            google_ocr_error = "GOOGLE_OCR_API_KEY environment variable is not set"
+        else:
+            try:
+                elements_by_page = apply_google_ocr_to_elements(elements_by_page, image_paths)
+            except Exception as e:
+                google_ocr_error = str(e)
 
     # Build response
     pages = []
