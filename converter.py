@@ -1,51 +1,72 @@
-from docling.document_converter import DocumentConverter
 import json
 import time
 import os
-import mlx
+import fitz  # PyMuPDF
 
-# Disable GPU for MLX/ML frameworks (if supported)
-# os.environ["CUDA_VISIBLE_DEVICES"] = ""
+from google_ocr import GoogleOCR
 
-source = "tables.pdf"  # document per local path or URL
-converter = DocumentConverter(allowed_formats=["pdf"])
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+SOURCE = "tables.pdf"          # PDF to process
+OUTPUT_DIR = "output_pages"    # directory for page images + per-page JSONs
+ZOOM = 2.0                     # rendering scale factor (higher = sharper images)
+
+# Provide either an API key or the path to a Google service-account JSON file.
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS_PATH", "")
+
+# ---------------------------------------------------------------------------
+# Main conversion
+# ---------------------------------------------------------------------------
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+ocr = GoogleOCR(
+    api_key=GOOGLE_API_KEY if GOOGLE_API_KEY else None,
+    credentials_path=GOOGLE_CREDENTIALS if GOOGLE_CREDENTIALS else None,
+)
+
+doc = fitz.open(SOURCE)
 start_time = time.time()
-result = converter.convert(source)
+
+for page_index in range(len(doc)):
+    page = doc[page_index]
+    page_num = page_index + 1
+
+    # Render page to a raster image
+    mat = fitz.Matrix(ZOOM, ZOOM)
+    pix = page.get_pixmap(matrix=mat)
+    image_name = f"page_{page_num:03d}.png"
+    image_path = os.path.join(OUTPUT_DIR, image_name)
+    pix.save(image_path)
+
+    img_width = pix.width
+    img_height = pix.height
+
+    # Use Google Vision OCR instead of docling's built-in OCR (e.g. rapidOCR)
+    text_regions = ocr.ocr_image(image_path)
+
+    # Build per-page annotation entry
+    page_data = {
+        "image": image_name,
+        "image_width": img_width,
+        "image_height": img_height,
+        "ocr_results": [
+            {"text": text, "bbox": bbox}
+            for text, bbox in text_regions
+        ],
+    }
+
+    # Save JSON named after the corresponding page image
+    json_name = f"{os.path.splitext(image_name)[0]}.json"
+    json_path = os.path.join(OUTPUT_DIR, json_name)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(page_data, f, ensure_ascii=False, indent=2)
+
+    print(f"Saved {json_name} (image: {img_width}x{img_height}, "
+          f"{len(text_regions)} OCR regions)")
+
+doc.close()
 end_time = time.time()
-print(result.document.export_to_markdown())
-print(f"Conversion completed in {end_time - start_time:.2f} seconds")
-
-# Keep doctags as a list so we can append structured entries
-doctags_data = {"doctags": []}
-
-# Optional: include raw doctags export as a separate field
-doctags_data["raw_doctags"] = result.document.export_to_doctags(result.document)
-
-# If pages is a dict, iterate with .items(); if list-like, use enumerate fallback
-pages = result.document.pages
-if hasattr(pages, "items"):
-    page_iter = pages.items()  # (page_num, page_obj)
-else:
-    page_iter = enumerate(pages, 1)  # (page_num, page_obj)
-
-for page_num, page in page_iter:
-    for element in getattr(page, "children", []):
-        bbox = getattr(element, "bbox", None)
-        doctags_data["doctags"].append({
-            "type": element.__class__.__name__,
-            "content": element.export_to_markdown() if hasattr(element, "export_to_markdown") else str(element),
-            "page": page_num,
-            "bbox": bbox.as_tuple() if bbox else None,
-            "location": {
-                "page": page_num,
-                "x": getattr(bbox, "x", None),
-                "y": getattr(bbox, "y", None),
-                "width": getattr(bbox, "width", None),
-                "height": getattr(bbox, "height", None),
-            }
-        })
-
-with open("output_doctags.json", "w", encoding="utf-8") as f:
-    json.dump(doctags_data, f, ensure_ascii=False, indent=2)
-
-print("Exported structured DocTags to output_doctags.json")
+print(f"\nConversion completed in {end_time - start_time:.2f} seconds")
+print(f"Per-page JSONs saved to: {OUTPUT_DIR}/")
