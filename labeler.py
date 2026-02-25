@@ -33,9 +33,11 @@ app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "labeler_data", "uploads")
 ANNOTATIONS_FOLDER = os.path.join(BASE_DIR, "labeler_data", "annotations")
+XML_ANNOTATIONS_FOLDER = os.path.join(BASE_DIR, "labeler_data", "xml_annotations")
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(ANNOTATIONS_FOLDER, exist_ok=True)
+os.makedirs(XML_ANNOTATIONS_FOLDER, exist_ok=True)
 
 # All supported docling tag types with display colors
 DOCLING_TAGS = [
@@ -447,9 +449,15 @@ def process_pdf():
     except Exception as e:
         docling_error = str(e)
 
-    # Apply OCR based on selected model
+    # Apply OCR based on selected model.
+    # When a specific OCR model is chosen, first clear docling's own text so
+    # only the selected OCR model's output is shown (not docling fallback text).
     ocr_model = request.form.get("ocr_model", "none")
     ocr_error = None
+    if ocr_model != "none":
+        for page_elements in elements_by_page.values():
+            for el in page_elements:
+                el["content"] = ""
     if ocr_model == "google":
         try:
             elements_by_page = apply_google_ocr_to_elements(elements_by_page, image_paths)
@@ -637,6 +645,12 @@ def export_xml():
         xml_output = '<?xml version="1.0" encoding="UTF-8"?>\n' + raw_xml
 
     safe_name = secure_filename(re.sub(r"[^\w\-.]", "_", doc_filename)) or "document"
+
+    # Save to xml_annotations folder (same pattern as JSON annotations)
+    xml_save_path = os.path.join(XML_ANNOTATIONS_FOLDER, f"{safe_name}_annotations.xml")
+    with open(xml_save_path, "w", encoding="utf-8") as f:
+        f.write(xml_output)
+
     return Response(
         xml_output,
         mimetype="application/xml",
@@ -647,9 +661,9 @@ def export_xml():
 @app.route("/redetect_tables", methods=["POST"])
 def redetect_tables():
     """
-    Re-run docling on a single page of the uploaded PDF to find tables that
-    were missed in the initial pass. Returns all elements found on that page
-    (filtered to tables by the client if desired).
+    Re-detect tables on a single page using the CV-based TableDetector
+    (table_detection.py) and populate cell text with Google OCR.
+    Returns table elements in the same format as /process.
     """
     data = request.json
     if not data:
@@ -661,46 +675,101 @@ def redetect_tables():
     if not pdf_filename:
         return jsonify({"error": "pdf_filename is required"}), 400
 
-    pdf_path = os.path.join(UPLOAD_FOLDER, secure_filename(pdf_filename))
-    if not os.path.exists(pdf_path):
-        return jsonify({"error": "PDF not found. Re-process the PDF first."}), 404
+    # Locate the page image saved during /process
+    pdf_stem = Path(secure_filename(pdf_filename)).stem
+    img_filename = f"{pdf_stem}_page_{page_no}.png"
+    img_path = os.path.join(UPLOAD_FOLDER, img_filename)
+    if not os.path.exists(img_path):
+        return jsonify({"error": f"Page image not found ({img_filename}). Re-process the PDF first."}), 404
 
-    # Extract the requested page into a temporary single-page PDF
     try:
-        from pypdf import PdfWriter, PdfReader
-    except ImportError:
-        try:
-            from PyPDF2 import PdfWriter, PdfReader
-        except ImportError:
-            return jsonify({"error": "pypdf / PyPDF2 not installed"}), 500
+        import cv2
+        import numpy as np
+        from table_detection import TableDetector, HTMLTableBuilder
 
-    tmp_pdf = None
-    try:
-        reader = PdfReader(pdf_path)
-        if page_no < 1 or page_no > len(reader.pages):
-            return jsonify({"error": f"Page {page_no} does not exist in this PDF"}), 400
+        pil_img = Image.open(img_path)
+        img_w, img_h = pil_img.size
+        cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-        writer = PdfWriter()
-        writer.add_page(reader.pages[page_no - 1])
-        tmp_pdf = os.path.join(UPLOAD_FOLDER, f"_redetect_{uuid.uuid4().hex}.pdf")
-        with open(tmp_pdf, "wb") as f:
-            writer.write(f)
+        detector = TableDetector()
+        detections = detector.detect(cv_img, page_no)
 
-        elements_by_page, _ = process_with_docling(tmp_pdf)
-        # The extracted PDF has only one page, so docling numbers it as page 1
-        new_elements = elements_by_page.get(1, [])
-        table_elements = [e for e in new_elements if e.get("label") == "table"]
+        # OCR each cell using Google Vision
+        api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+        ocr = GoogleOCR(api_key=api_key)
+
+        for det in detections:
+            for cell in det.cells:
+                x1 = max(0, int(cell.x))
+                y1 = max(0, int(cell.y))
+                x2 = min(img_w, int(cell.x + cell.width))
+                y2 = min(img_h, int(cell.y + cell.height))
+                if x2 - x1 < 4 or y2 - y1 < 4:
+                    continue
+                cropped = pil_img.crop((x1, y1, x2, y2))
+                tmp_path = os.path.join(UPLOAD_FOLDER, f"_cell_{uuid.uuid4().hex}.png")
+                cropped.save(tmp_path, "PNG")
+                try:
+                    text = ocr.google_vision_ocr(tmp_path)
+                    if text.strip():
+                        cell.text = text.strip()
+                except Exception:
+                    pass
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+
+            # Rebuild HTML with OCR text
+            num_rows = max((c.row for c in det.cells), default=0) + 1
+            num_cols = max((c.col for c in det.cells), default=0) + 1
+            builder = HTMLTableBuilder()
+            det.html = builder.build(det.cells, num_rows, num_cols)
+
+        # Convert to element format expected by the frontend
+        def _clamp_norm(v):
+            return round(max(0.0, min(1.0, v)), 4)
+
+        table_elements = []
+        for det in detections:
+            bbox_norm = {
+                "x1": _clamp_norm(det.x / img_w),
+                "y1": _clamp_norm(det.y / img_h),
+                "x2": _clamp_norm((det.x + det.width) / img_w),
+                "y2": _clamp_norm((det.y + det.height) / img_h),
+            }
+            table_cells = [
+                {
+                    "row": cell.row,
+                    "col": cell.col,
+                    "row_span": cell.rowspan,
+                    "col_span": cell.colspan,
+                    "bbox_norm": {
+                        "x1": _clamp_norm(cell.x / img_w),
+                        "y1": _clamp_norm(cell.y / img_h),
+                        "x2": _clamp_norm((cell.x + cell.width) / img_w),
+                        "y2": _clamp_norm((cell.y + cell.height) / img_h),
+                    },
+                    "text": cell.text,
+                }
+                for cell in det.cells
+            ]
+            table_elements.append({
+                "id": str(uuid.uuid4()),
+                "label": "table",
+                "content": "",
+                "bbox_norm": bbox_norm,
+                "table_html": det.html,
+                "table_cells": table_cells,
+            })
 
         return jsonify({
             "tables": table_elements,
-            "all_elements": new_elements,
+            "all_elements": table_elements,
             "page_no": page_no,
         })
+
     except Exception as e:
         return jsonify({"error": f"Re-detection failed: {e}"}), 500
-    finally:
-        if tmp_pdf and os.path.exists(tmp_pdf):
-            os.remove(tmp_pdf)
 
 
 # ---------------------------------------------------------------------------
