@@ -534,6 +534,7 @@
           <button class="btn btn-success" onclick="applyEdit()">✔ Apply</button>
           <button class="btn btn-danger" onclick="deleteSelected()">🗑 Delete</button>
           <button class="btn btn-secondary" onclick="deselectElement()">✕ Cancel</button>
+          <button class="btn btn-secondary" id="btn-ocr-region" onclick="ocrRegion()" title="Run Google OCR on the selected element's region">🔍 OCR Region</button>
         </div>
       </div>
     </div>
@@ -1286,12 +1287,17 @@ function copyPath() {
 function renderTablePreview(el) {
   const container = document.getElementById('table-preview');
   const content   = document.getElementById('table-preview-content');
+  const body      = document.getElementById('table-preview-body');
+  const toggle    = document.getElementById('table-preview-toggle');
 
   if (!el || el.label !== 'table') {
     container.style.display = 'none';
     return;
   }
   container.style.display = '';
+  // Always expand when a table element is selected
+  body.style.display = '';
+  toggle.textContent = '▲ hide';
 
   if (el.table_html) {
     // Backend provided full cell-grid HTML (with colspan/rowspan)
@@ -1374,32 +1380,28 @@ async function exportXML() {
     };
   });
 
-  showSpinner('Generating XML…');
+  showSpinner('Saving XML annotations…');
   try {
     const resp = await fetch('/export_xml', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filename: state.filename, pages: pagesPayload }),
     });
-    if (!resp.ok) {
-      const d = await resp.json().catch(() => ({}));
-      toast('Export failed: ' + (d.error || resp.statusText), 'error');
-      return;
-    }
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = (state.filename || 'document') + '_annotations.xml';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    toast('XML exported successfully!', 'success');
-  } catch(e) {
-    toast('Export error: ' + e.message, 'error');
-  } finally {
+    const data = await resp.json();
     hideSpinner();
+    if (data.success) {
+      const pathInfo = document.getElementById('save-path-info');
+      const pathText = document.getElementById('save-path-text');
+      state._lastSavedPath = data.saved_to;
+      pathText.textContent = (data.saved_to_rel || data.saved_to) + ` (${data.num_pages} file${data.num_pages > 1 ? 's' : ''})`;
+      pathInfo.style.display = '';
+      toast(`✔ XML saved: ${data.num_pages} page file${data.num_pages > 1 ? 's' : ''} in xml_annotations/`, 'success');
+    } else {
+      toast('XML save failed: ' + (data.error || 'unknown error'), 'error');
+    }
+  } catch(e) {
+    hideSpinner();
+    toast('XML save error: ' + e.message, 'error');
   }
 }
 
@@ -1452,7 +1454,37 @@ async function redetectTables() {
   }
 }
 
-// ─── Resizable sidebar divider ────────────────────────────────────────────────
+// ─── OCR on selected region ───────────────────────────────────────────────────
+async function ocrRegion() {
+  if (!state.selectedId) { toast('Select an element first.', 'error'); return; }
+  const el = getCurrentPageElement(state.selectedId);
+  if (!el || !el.bbox_norm) { toast('Selected element has no bounding box.', 'error'); return; }
+
+  const imgUrl = state.pageImages[state.currentPage] || '';
+  const imgFilename = imgUrl.replace(/^.*\//, '');
+  if (!imgFilename) { toast('Page image not available.', 'error'); return; }
+
+  showSpinner('Running Google OCR on region…');
+  try {
+    const resp = await fetch('/ocr_region', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_filename: imgFilename, bbox_norm: el.bbox_norm }),
+    });
+    const data = await resp.json();
+    hideSpinner();
+    if (data.error) { toast('OCR failed: ' + data.error, 'error'); return; }
+    const text = data.text || '';
+    if (!text) { toast('No text recognised in this region.', 'warning'); return; }
+    document.getElementById('edit-content').value = text;
+    toast('OCR complete – text inserted into content field.', 'success');
+  } catch(e) {
+    hideSpinner();
+    toast('OCR error: ' + e.message, 'error');
+  }
+}
+
+
 (function initResizeHandle() {
   const handle  = document.getElementById('resize-handle');
   const sidebar = document.getElementById('sidebar');
