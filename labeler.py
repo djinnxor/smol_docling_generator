@@ -16,6 +16,8 @@ import os
 import re
 import uuid
 import argparse
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from PIL import Image
@@ -31,9 +33,11 @@ app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "labeler_data", "uploads")
 ANNOTATIONS_FOLDER = os.path.join(BASE_DIR, "labeler_data", "annotations")
+XML_ANNOTATIONS_FOLDER = os.path.join(BASE_DIR, "labeler_data", "xml_annotations")
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(ANNOTATIONS_FOLDER, exist_ok=True)
+os.makedirs(XML_ANNOTATIONS_FOLDER, exist_ok=True)
 
 # All supported docling tag types with display colors
 DOCLING_TAGS = [
@@ -212,6 +216,36 @@ def _bbox_to_norm(bbox, page_width, page_height):
     return {"x1": round(x1, 4), "y1": round(y1, 4), "x2": round(x2, 4), "y2": round(y2, 4)}
 
 
+def _extract_table_cell_bboxes(item, page_width, page_height):
+    """
+    Extract per-cell normalised bounding boxes from a docling TableItem.
+    Returns a list of cell dicts or None if unavailable.
+    """
+    try:
+        grid = item.data.grid
+        if not grid:
+            return None
+        cells = []
+        for row_idx, row in enumerate(grid):
+            for col_idx, cell in enumerate(row):
+                cell_bbox = getattr(cell, "bbox", None)
+                if cell_bbox is None:
+                    continue
+                norm = _bbox_to_norm(cell_bbox, page_width, page_height)
+                if norm:
+                    cells.append({
+                        "row": row_idx,
+                        "col": col_idx,
+                        "row_span": max(1, int(getattr(cell, "row_span", 1) or 1)),
+                        "col_span": max(1, int(getattr(cell, "col_span", 1) or 1)),
+                        "bbox_norm": norm,
+                        "text": str(getattr(cell, "text", "") or ""),
+                    })
+        return cells if cells else None
+    except Exception:
+        return None
+
+
 def process_with_docling(pdf_path):
     """
     Process PDF with docling and return elements grouped by page.
@@ -267,11 +301,14 @@ def process_with_docling(pdf_path):
                 "content": content,
                 "bbox_norm": bbox_norm,
             }
-            # For table items include the structured cell grid as HTML
+            # For table items include the structured cell grid as HTML and cell bboxes
             if label == "table":
                 thtml = _render_table_html(item)
                 if thtml:
                     element["table_html"] = thtml
+                cell_bboxes = _extract_table_cell_bboxes(item, pd["width"], pd["height"])
+                if cell_bboxes:
+                    element["table_cells"] = cell_bboxes
             elements_by_page.setdefault(page_no, []).append(element)
 
     return elements_by_page, page_dims
@@ -323,9 +360,59 @@ def apply_google_ocr_to_elements(elements_by_page, image_paths):
     return elements_by_page
 
 
-# ---------------------------------------------------------------------------
-# Flask routes
-# ---------------------------------------------------------------------------
+def apply_rapidocr_to_elements(elements_by_page, image_paths):
+    """
+    Replace each element's text content using RapidOCR (docling's built-in OCR engine).
+    Crops each element's bounding box from the page image and OCRs the region.
+    Labels that typically contain no text (e.g. 'picture') are skipped.
+    """
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        try:
+            from rapidocr_openvino import RapidOCR
+        except ImportError:
+            raise ImportError(
+                "RapidOCR is not installed. Run: pip install rapidocr-onnxruntime"
+            )
+
+    import numpy as np
+
+    engine = RapidOCR()
+    skip_labels = {"picture"}
+
+    for page_no, img_path in enumerate(image_paths, 1):
+        page_elements = elements_by_page.get(page_no, [])
+        if not page_elements:
+            continue
+        img = Image.open(img_path)
+        img_w, img_h = img.size
+
+        for el in page_elements:
+            if el.get("label") in skip_labels:
+                continue
+            bbox = el.get("bbox_norm")
+            if not bbox:
+                continue
+            x1 = int(bbox["x1"] * img_w)
+            y1 = int(bbox["y1"] * img_h)
+            x2 = int(bbox["x2"] * img_w)
+            y2 = int(bbox["y2"] * img_h)
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                continue
+            cropped = img.crop((x1, y1, x2, y2))
+            img_array = np.array(cropped)
+            try:
+                result, _ = engine(img_array)
+                if result:
+                    lines = [r[1] for r in result if r and len(r) > 1 and r[1]]
+                    text = "\n".join(lines)
+                    if text.strip():
+                        el["content"] = text.strip()
+            except Exception:
+                pass
+
+    return elements_by_page
 
 @app.route("/")
 def index():
@@ -362,13 +449,25 @@ def process_pdf():
     except Exception as e:
         docling_error = str(e)
 
-    # Apply Google OCR to replace docling's built-in OCR text (if API key is set)
-    google_ocr_error = None
-    if os.environ.get("GOOGLE_OCR_API_KEY"):
+    # Apply OCR based on selected model.
+    # When a specific OCR model is chosen, first clear docling's own text so
+    # only the selected OCR model's output is shown (not docling fallback text).
+    ocr_model = request.form.get("ocr_model", "none")
+    ocr_error = None
+    if ocr_model != "none":
+        for page_elements in elements_by_page.values():
+            for el in page_elements:
+                el["content"] = ""
+    if ocr_model == "google":
         try:
             elements_by_page = apply_google_ocr_to_elements(elements_by_page, image_paths)
         except Exception as e:
-            google_ocr_error = str(e)
+            ocr_error = f"Google OCR failed: {e}"
+    elif ocr_model == "rapidocr":
+        try:
+            elements_by_page = apply_rapidocr_to_elements(elements_by_page, image_paths)
+        except Exception as e:
+            ocr_error = f"RapidOCR failed: {e}"
 
     # Build response
     pages = []
@@ -383,13 +482,14 @@ def process_pdf():
 
     resp = {
         "filename": Path(file.filename).stem,
+        "pdf_filename": safe_name,
         "num_pages": len(pages),
         "pages": pages,
     }
     if docling_error:
         resp["docling_warning"] = f"Docling processing failed: {docling_error}"
-    if google_ocr_error:
-        resp["google_ocr_warning"] = f"Google OCR failed: {google_ocr_error}"
+    if ocr_error:
+        resp["ocr_warning"] = ocr_error
 
     return jsonify(resp)
 
@@ -474,6 +574,264 @@ def load_annotations(filename):
         return jsonify({"error": "File not found"}), 404
     with open(fpath, encoding="utf-8") as f:
         return jsonify(json.load(f))
+
+
+@app.route("/ocr_region", methods=["POST"])
+def ocr_region():
+    """
+    Run Google OCR on a specific bounding box region of a page image.
+    Expects JSON: { image_filename: str, bbox_norm: {x1, y1, x2, y2} }
+    Returns: { text: str }
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    image_filename = data.get("image_filename", "")
+    bbox_norm = data.get("bbox_norm", {})
+
+    if not image_filename:
+        return jsonify({"error": "image_filename is required"}), 400
+
+    img_path = os.path.join(UPLOAD_FOLDER, secure_filename(Path(image_filename).name))
+    if not os.path.exists(img_path):
+        return jsonify({"error": f"Image not found: {image_filename}"}), 404
+
+    try:
+        img = Image.open(img_path)
+        img_w, img_h = img.size
+        x1 = int(bbox_norm.get("x1", 0) * img_w)
+        y1 = int(bbox_norm.get("y1", 0) * img_h)
+        x2 = int(bbox_norm.get("x2", 1) * img_w)
+        y2 = int(bbox_norm.get("y2", 1) * img_h)
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return jsonify({"error": "Bounding box too small"}), 400
+
+        cropped = img.crop((x1, y1, x2, y2))
+        tmp_path = os.path.join(UPLOAD_FOLDER, f"_ocr_{uuid.uuid4().hex}.png")
+        cropped.save(tmp_path, "PNG")
+        try:
+            api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+            ocr = GoogleOCR(api_key=api_key)
+            text = ocr.google_vision_ocr(tmp_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        return jsonify({"text": text.strip()})
+    except Exception as e:
+        return jsonify({"error": f"OCR failed: {e}"}), 500
+
+
+@app.route("/export_xml", methods=["POST"])
+def export_xml():
+    """
+    Save each page's annotations as a separate XML file in xml_annotations/,
+    named after the page image. Does NOT return a file download.
+    Accepts the same JSON payload as /save_annotations.
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    pages_data = data.get("pages", {})
+    saved_files = []
+
+    for p, page_info in sorted(pages_data.items(), key=lambda x: int(x[0])):
+        if isinstance(page_info, list):
+            elements = page_info
+            image_name = f"page_{p}"
+            width = 0
+            height = 0
+        else:
+            elements = page_info.get("elements", [])
+            image_name = page_info.get("image_name", f"page_{p}")
+            width = page_info.get("width", 0)
+            height = page_info.get("height", 0)
+
+        safe_image_name = secure_filename(re.sub(r"[^\w\-.]", "_", image_name)) or f"page_{p}"
+
+        page_el = ET.Element("page")
+        page_el.set("num", str(p))
+        page_el.set("image", safe_image_name)
+        page_el.set("width", str(width))
+        page_el.set("height", str(height))
+
+        for el in elements:
+            label = re.sub(r"[^a-zA-Z0-9_]", "_", el.get("label", "text"))
+            content = el.get("content", "")
+            bbox = el.get("bbox_norm", {})
+
+            item_el = ET.SubElement(page_el, label)
+            item_el.set("bbox_x1", str(bbox.get("x1", 0)))
+            item_el.set("bbox_y1", str(bbox.get("y1", 0)))
+            item_el.set("bbox_x2", str(bbox.get("x2", 1)))
+            item_el.set("bbox_y2", str(bbox.get("y2", 1)))
+
+            if label == "table" and el.get("table_html"):
+                try:
+                    table_xml = ET.fromstring(el["table_html"])
+                    item_el.append(table_xml)
+                except Exception:
+                    item_el.text = content
+            else:
+                item_el.text = content
+
+        # Pretty-print
+        raw_xml = ET.tostring(page_el, encoding="unicode")
+        try:
+            pretty = minidom.parseString(raw_xml).toprettyxml(indent="  ")
+            lines = pretty.split("\n")
+            if lines and lines[0].startswith("<?xml"):
+                lines = lines[1:]
+            xml_output = '<?xml version="1.0" encoding="UTF-8"?>\n' + "\n".join(lines)
+        except Exception:
+            xml_output = '<?xml version="1.0" encoding="UTF-8"?>\n' + raw_xml
+
+        # Save to xml_annotations folder, one file per page image
+        xml_save_path = os.path.join(XML_ANNOTATIONS_FOLDER, f"{safe_image_name}_annotations.xml")
+        with open(xml_save_path, "w", encoding="utf-8") as f:
+            f.write(xml_output)
+        saved_files.append(xml_save_path)
+
+    if not saved_files:
+        return jsonify({"error": "No pages to save"}), 400
+
+    try:
+        rel_dir = os.path.relpath(XML_ANNOTATIONS_FOLDER, BASE_DIR)
+    except ValueError:
+        rel_dir = XML_ANNOTATIONS_FOLDER
+
+    return jsonify({
+        "success": True,
+        "saved_to": saved_files[0],
+        "saved_to_rel": rel_dir,
+        "saved_files": [os.path.basename(f) for f in saved_files],
+        "num_pages": len(saved_files),
+    })
+
+
+@app.route("/redetect_tables", methods=["POST"])
+def redetect_tables():
+    """
+    Re-detect tables on a single page using the CV-based TableDetector
+    (table_detection.py) and populate cell text with Google OCR.
+    Returns table elements in the same format as /process.
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    pdf_filename = data.get("pdf_filename", "")
+    page_no = int(data.get("page_no", 1))
+
+    if not pdf_filename:
+        return jsonify({"error": "pdf_filename is required"}), 400
+
+    # Locate the page image saved during /process
+    pdf_stem = Path(secure_filename(pdf_filename)).stem
+    img_filename = f"{pdf_stem}_page_{page_no}.png"
+    img_path = os.path.join(UPLOAD_FOLDER, img_filename)
+    if not os.path.exists(img_path):
+        return jsonify({"error": f"Page image not found ({img_filename}). Re-process the PDF first."}), 404
+
+    try:
+        import cv2
+        import numpy as np
+        from table_detection import TableDetector, HTMLTableBuilder
+
+        pil_img = Image.open(img_path)
+        img_w, img_h = pil_img.size
+        cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+        detector = TableDetector()
+        detections = detector.detect(cv_img, page_no)
+
+        # OCR each cell using Google Vision
+        api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+        ocr = GoogleOCR(api_key=api_key)
+
+        for det in detections:
+            for cell in det.cells:
+                x1 = max(0, int(cell.x))
+                y1 = max(0, int(cell.y))
+                x2 = min(img_w, int(cell.x + cell.width))
+                y2 = min(img_h, int(cell.y + cell.height))
+                if x2 - x1 < 4 or y2 - y1 < 4:
+                    continue
+                cropped = pil_img.crop((x1, y1, x2, y2))
+                tmp_path = os.path.join(UPLOAD_FOLDER, f"_cell_{uuid.uuid4().hex}.png")
+                cropped.save(tmp_path, "PNG")
+                try:
+                    text = ocr.google_vision_ocr(tmp_path)
+                    if text.strip():
+                        cell.text = text.strip()
+                except Exception:
+                    pass
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+
+            # Rebuild HTML with OCR text
+            num_rows = max((c.row for c in det.cells), default=0) + 1
+            num_cols = max((c.col for c in det.cells), default=0) + 1
+            builder = HTMLTableBuilder()
+            det.html = builder.build(det.cells, num_rows, num_cols)
+
+        # Convert to element format expected by the frontend
+        def _clamp_norm(v):
+            return round(max(0.0, min(1.0, v)), 4)
+
+        table_elements = []
+        for det in detections:
+            bbox_norm = {
+                "x1": _clamp_norm(det.x / img_w),
+                "y1": _clamp_norm(det.y / img_h),
+                "x2": _clamp_norm((det.x + det.width) / img_w),
+                "y2": _clamp_norm((det.y + det.height) / img_h),
+            }
+            table_cells = [
+                {
+                    "row": cell.row,
+                    "col": cell.col,
+                    "row_span": cell.rowspan,
+                    "col_span": cell.colspan,
+                    "bbox_norm": {
+                        "x1": _clamp_norm(cell.x / img_w),
+                        "y1": _clamp_norm(cell.y / img_h),
+                        "x2": _clamp_norm((cell.x + cell.width) / img_w),
+                        "y2": _clamp_norm((cell.y + cell.height) / img_h),
+                    },
+                    "text": cell.text,
+                }
+                for cell in det.cells
+            ]
+            # Build content field row-by-row to preserve table structure
+            rows_text = {}
+            for cell in det.cells:
+                if cell.text:
+                    rows_text.setdefault(cell.row, []).append(cell.text)
+            content_str = "\n".join(
+                " | ".join(texts) for texts in sorted(rows_text.items())
+                if (texts := texts[1])
+            ) if rows_text else ""
+            table_elements.append({
+                "id": str(uuid.uuid4()),
+                "label": "table",
+                "content": content_str,
+                "bbox_norm": bbox_norm,
+                "table_html": det.html,
+                "table_cells": table_cells,
+            })
+
+        return jsonify({
+            "tables": table_elements,
+            "all_elements": table_elements,
+            "page_no": page_no,
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Re-detection failed: {e}"}), 500
 
 
 # ---------------------------------------------------------------------------
