@@ -9,6 +9,8 @@ import torch
 import csv
 from pdf2image import convert_from_path
 import os
+import cv2
+import numpy as np
 
 class GoogleOCR:
     def __init__(self, api_key=None):
@@ -52,7 +54,6 @@ class GoogleOCR:
                 response_data = result['responses'][0]
                 text_annotations = response_data.get('textAnnotations', [])
                 if text_annotations:
-                    print(text_annotations[0]['description'])  # Print only the full text
                     return text_annotations[0]['description']
         return ""
     
@@ -86,6 +87,46 @@ class GoogleOCR:
             'width': (bbox['width'] / img_width) * 100,
             'height': (bbox['height'] / img_height) * 100
         }
+    
+    def _image_to_base64(self, image: np.ndarray) -> str:
+        _, buffer = cv2.imencode(".png", image)
+        return base64.b64encode(buffer).decode("utf-8")
+    
+    def recognize(self, image: np.ndarray) -> str:
+        """Run OCR on a single image/cell crop and return text."""
+        if image is None or image.size == 0:
+            return ""
+        # Skip tiny crops
+        h, w = image.shape[:2]
+        if w < 5 or h < 5:
+            return ""
+        encoded_image = self._image_to_base64(image)
+        
+        request_body = {
+            "requests": [
+                {
+                    "image": {
+                        "content": encoded_image
+                    },
+                    "features": [
+                        {
+                            "type": "DOCUMENT_TEXT_DETECTION"
+                        }
+                    ]
+                }
+            ]
+        }
+        try:
+            resp = requests.post(self.url, json=request_body, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            annotations = data.get("responses", [{}])[0].get("textAnnotations", [])
+            if annotations:
+                return annotations[0].get("description", "").strip().replace("\n", " ")
+        except Exception as e:
+            print(f"[GoogleVisionOCR] Error: {e}")
+        return ""
+
 
 if __name__ == "__main__":
     ocr = GoogleOCR(api_key="AIzaSyCFdvigsgMlOnn_gQFaLQgqfhwtWDA7tYs")
