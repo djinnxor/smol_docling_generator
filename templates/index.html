@@ -1413,42 +1413,64 @@ function restorePage() {
 async function exportXML() {
   if (!state.filename) { toast('No document loaded.', 'error'); return; }
 
-  const pagesPayload = {};
-  Object.keys(state.pages).forEach(pageNum => {
-    if (state.removedPages.has(parseInt(pageNum))) return;
+  const pageNums = Object.keys(state.pages)
+    .map(Number)
+    .filter(n => !state.removedPages.has(n))
+    .sort((a, b) => a - b);
+
+  if (!pageNums.length) { toast('No pages to export.', 'error'); return; }
+
+  let savedCount = 0;
+  let lastRel = '';
+  const errors = [];
+
+  const lastPage = pageNums[pageNums.length - 1];
+
+  for (const pageNum of pageNums) {
+    showSpinner(`Saving XML – page ${pageNum} of ${lastPage}…`);
     const imgUrl = state.pageImages[pageNum] || '';
     const imgName = imgUrl.replace(/^.*\//, '').replace(/\.[^.]+$/, '');
     const dims = state.pageDims[pageNum] || {};
-    pagesPayload[pageNum] = {
-      image_name: imgName,
-      width: dims.width || 0,
-      height: dims.height || 0,
-      elements: state.pages[pageNum] || [],
+    const payload = {
+      filename: state.filename,
+      pages: {
+        [pageNum]: {
+          image_name: imgName,
+          width: dims.width || 0,
+          height: dims.height || 0,
+          elements: state.pages[pageNum] || [],
+        },
+      },
     };
-  });
-
-  showSpinner('Saving XML annotations…');
-  try {
-    const resp = await fetch('/export_xml', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename: state.filename, pages: pagesPayload }),
-    });
-    const data = await resp.json();
-    hideSpinner();
-    if (data.success) {
-      const pathInfo = document.getElementById('save-path-info');
-      const pathText = document.getElementById('save-path-text');
-      state._lastSavedPath = data.saved_to;
-      pathText.textContent = (data.saved_to_rel || data.saved_to) + ` (${data.num_pages} file${data.num_pages > 1 ? 's' : ''})`;
-      pathInfo.style.display = '';
-      toast(`✔ XML saved: ${data.num_pages} page file${data.num_pages > 1 ? 's' : ''} in xml_annotations/`, 'success');
-    } else {
-      toast('XML save failed: ' + (data.error || 'unknown error'), 'error');
+    try {
+      const resp = await fetch('/export_xml', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (data.success) {
+        savedCount++;
+        if (data.saved_to_rel) lastRel = data.saved_to_rel;
+      } else {
+        errors.push(`page ${pageNum}: ${data.error || 'unknown error'}`);
+      }
+    } catch (e) {
+      errors.push(`page ${pageNum}: ${e.message}`);
     }
-  } catch(e) {
-    hideSpinner();
-    toast('XML save error: ' + e.message, 'error');
+  }
+
+  hideSpinner();
+
+  if (savedCount > 0) {
+    const pathInfo = document.getElementById('save-path-info');
+    const pathText = document.getElementById('save-path-text');
+    pathText.textContent = (lastRel || 'xml_annotations/') + ` (${savedCount} file${savedCount > 1 ? 's' : ''})`;
+    pathInfo.style.display = '';
+    toast(`✔ XML saved: ${savedCount} page file${savedCount > 1 ? 's' : ''} in xml_annotations/`, 'success');
+  }
+  if (errors.length) {
+    toast('XML save errors: ' + errors.join('; '), 'error');
   }
 }
 
