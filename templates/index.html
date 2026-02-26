@@ -357,9 +357,10 @@
     font-size: .78rem;
     color: var(--text);
     width: 100%;
+    border: 2px solid rgba(160,170,220,0.7);
   }
   #table-preview-body th, #table-preview-body td {
-    border: 1px solid var(--border);
+    border: 1px solid rgba(160,170,220,0.5);
     padding: 4px 7px;
     white-space: pre-wrap;
     vertical-align: top;
@@ -807,8 +808,8 @@ function drawTableGrid(el, x, y, w, h, color) {
   // Prefer per-cell bounding boxes from docling when available
   if (el.table_cells && el.table_cells.length) {
     ctx.save();
-    ctx.strokeStyle = color + 'cc';
-    ctx.lineWidth = 0.8;
+    ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+    ctx.lineWidth = 1.5;
     el.table_cells.forEach(cell => {
       const { x: cx, y: cy, w: cw, h: ch } = normToCanvas(cell.bbox_norm);
       ctx.strokeRect(cx, cy, cw, ch);
@@ -835,8 +836,8 @@ function drawTableGrid(el, x, y, w, h, color) {
   if (numCols < 1) return;
 
   ctx.save();
-  ctx.strokeStyle = color + 'aa';
-  ctx.lineWidth = 0.8;
+  ctx.strokeStyle = 'rgba(255,255,255,0.6)';
+  ctx.lineWidth = 1.5;
   ctx.setLineDash([]);
   for (let r = 1; r < numRows; r++) {
     const ry = y + h * r / numRows;
