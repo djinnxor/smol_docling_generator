@@ -513,15 +513,6 @@
           <textarea id="edit-content" rows="5"></textarea>
         </div>
 
-        <!-- Table structure preview (visible for table elements only) -->
-        <div id="table-preview">
-          <div id="table-preview-header" onclick="toggleTablePreview()">
-            📊 Table Structure <span id="table-preview-toggle">▼ show</span>
-          </div>
-          <div id="table-preview-body" style="display:none">
-            <div id="table-preview-content"></div>
-          </div>
-        </div>
         <div class="field">
           <label>Bounding Box (normalised 0–1, top-left origin)</label>
           <div class="bbox-grid">
@@ -536,6 +527,16 @@
           <button class="btn btn-danger" onclick="deleteSelected()">🗑 Delete</button>
           <button class="btn btn-secondary" onclick="deselectElement()">✕ Cancel</button>
           <button class="btn btn-secondary" id="btn-ocr-region" onclick="ocrRegion()" title="Run Google OCR on the selected element's region">🔍 OCR Region</button>
+        </div>
+
+        <!-- Table reconstruction (visible for table elements only, below OCR Region button) -->
+        <div id="table-preview">
+          <div id="table-preview-header" onclick="toggleTablePreview()">
+            📊 Table Reconstruction <span id="table-preview-toggle">▼ show</span>
+          </div>
+          <div id="table-preview-body" style="display:none">
+            <div id="table-preview-content"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -1301,8 +1302,11 @@ function renderTablePreview(el) {
   toggle.textContent = '▲ hide';
 
   if (el.table_html) {
-    // Backend provided full cell-grid HTML (with colspan/rowspan)
+    // Backend provided full cell-grid HTML (with colspan/rowspan and text)
     content.innerHTML = el.table_html;
+  } else if (el.table_cells && el.table_cells.length) {
+    // Build reconstruction from per-cell data (row, col, row_span, col_span, text)
+    content.innerHTML = buildTableFromCells(el.table_cells);
   } else {
     // Fallback: parse markdown table from content field
     const html = markdownTableToHtml(el.content || '');
@@ -1342,6 +1346,48 @@ function markdownTableToHtml(md) {
 
   html += '</table>';
   return html === '<table></table>' ? '' : html;
+}
+
+// ─── Build HTML table from table_cells array ──────────────────────────────────
+function buildTableFromCells(cells) {
+  if (!cells || !cells.length) return '';
+  // Determine grid dimensions
+  let maxRow = 0, maxCol = 0;
+  cells.forEach(c => {
+    maxRow = Math.max(maxRow, c.row + (c.row_span || 1) - 1);
+    maxCol = Math.max(maxCol, c.col + (c.col_span || 1) - 1);
+  });
+  const numRows = maxRow + 1;
+  const numCols = maxCol + 1;
+
+  // Fill grid to track which positions are occupied by a span
+  const occupied = Array.from({length: numRows}, () => new Array(numCols).fill(false));
+
+  // Sort cells by row then col so the table renders top-to-bottom, left-to-right
+  const sorted = cells.slice().sort((a, b) => a.row !== b.row ? a.row - b.row : a.col - b.col);
+
+  const rowsHtml = [];
+  for (let r = 0; r < numRows; r++) {
+    let rowHtml = '<tr>';
+    for (let c = 0; c < numCols; c++) {
+      if (occupied[r][c]) continue;
+      const cell = sorted.find(x => x.row === r && x.col === c);
+      if (!cell) { rowHtml += '<td></td>'; continue; }
+      const rs = cell.row_span || 1;
+      const cs = cell.col_span || 1;
+      // Mark all spanned positions as occupied
+      for (let dr = 0; dr < rs; dr++)
+        for (let dc = 0; dc < cs; dc++)
+          if (r + dr < numRows && c + dc < numCols)
+            occupied[r + dr][c + dc] = true;
+      const attrs = (rs > 1 ? ` rowspan="${rs}"` : '') + (cs > 1 ? ` colspan="${cs}"` : '');
+      const text = escHtml(cell.text || '');
+      rowHtml += `<td${attrs}>${text}</td>`;
+    }
+    rowHtml += '</tr>';
+    rowsHtml.push(rowHtml);
+  }
+  return '<table>' + rowsHtml.join('') + '</table>';
 }
 
 // ─── Page remove / restore ────────────────────────────────────────────────────
