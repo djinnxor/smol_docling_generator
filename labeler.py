@@ -19,7 +19,7 @@ import argparse
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify, send_from_directory, Response
+from flask import Flask, render_template, request, jsonify, send_from_directory
 from PIL import Image
 from werkzeug.utils import secure_filename
 from google_ocr import GoogleOCR
@@ -576,22 +576,66 @@ def load_annotations(filename):
         return jsonify(json.load(f))
 
 
+@app.route("/ocr_region", methods=["POST"])
+def ocr_region():
+    """
+    Run Google OCR on a specific bounding box region of a page image.
+    Expects JSON: { image_filename: str, bbox_norm: {x1, y1, x2, y2} }
+    Returns: { text: str }
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    image_filename = data.get("image_filename", "")
+    bbox_norm = data.get("bbox_norm", {})
+
+    if not image_filename:
+        return jsonify({"error": "image_filename is required"}), 400
+
+    img_path = os.path.join(UPLOAD_FOLDER, secure_filename(Path(image_filename).name))
+    if not os.path.exists(img_path):
+        return jsonify({"error": f"Image not found: {image_filename}"}), 404
+
+    try:
+        img = Image.open(img_path)
+        img_w, img_h = img.size
+        x1 = int(bbox_norm.get("x1", 0) * img_w)
+        y1 = int(bbox_norm.get("y1", 0) * img_h)
+        x2 = int(bbox_norm.get("x2", 1) * img_w)
+        y2 = int(bbox_norm.get("y2", 1) * img_h)
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return jsonify({"error": "Bounding box too small"}), 400
+
+        cropped = img.crop((x1, y1, x2, y2))
+        tmp_path = os.path.join(UPLOAD_FOLDER, f"_ocr_{uuid.uuid4().hex}.png")
+        cropped.save(tmp_path, "PNG")
+        try:
+            api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+            ocr = GoogleOCR(api_key=api_key)
+            text = ocr.google_vision_ocr(tmp_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        return jsonify({"text": text.strip()})
+    except Exception as e:
+        return jsonify({"error": f"OCR failed: {e}"}), 500
+
+
 @app.route("/export_xml", methods=["POST"])
 def export_xml():
     """
-    Export all page annotations as a DocTags-style XML file.
+    Save each page's annotations as a separate XML file in xml_annotations/,
+    named after the page image. Does NOT return a file download.
     Accepts the same JSON payload as /save_annotations.
     """
     data = request.json
     if not data:
         return jsonify({"error": "No data provided"}), 400
 
-    doc_filename = data.get("filename", "document")
     pages_data = data.get("pages", {})
-
-    root = ET.Element("document")
-    root.set("filename", doc_filename)
-    root.set("total_pages", str(len(pages_data)))
+    saved_files = []
 
     for p, page_info in sorted(pages_data.items(), key=lambda x: int(x[0])):
         if isinstance(page_info, list):
@@ -605,9 +649,11 @@ def export_xml():
             width = page_info.get("width", 0)
             height = page_info.get("height", 0)
 
-        page_el = ET.SubElement(root, "page")
+        safe_image_name = secure_filename(re.sub(r"[^\w\-.]", "_", image_name)) or f"page_{p}"
+
+        page_el = ET.Element("page")
         page_el.set("num", str(p))
-        page_el.set("image", image_name)
+        page_el.set("image", safe_image_name)
         page_el.set("width", str(width))
         page_el.set("height", str(height))
 
@@ -623,7 +669,6 @@ def export_xml():
             item_el.set("bbox_y2", str(bbox.get("y2", 1)))
 
             if label == "table" and el.get("table_html"):
-                # Embed parsed table structure as XML children
                 try:
                     table_xml = ET.fromstring(el["table_html"])
                     item_el.append(table_xml)
@@ -632,30 +677,38 @@ def export_xml():
             else:
                 item_el.text = content
 
-    # Pretty-print
-    raw_xml = ET.tostring(root, encoding="unicode")
+        # Pretty-print
+        raw_xml = ET.tostring(page_el, encoding="unicode")
+        try:
+            pretty = minidom.parseString(raw_xml).toprettyxml(indent="  ")
+            lines = pretty.split("\n")
+            if lines and lines[0].startswith("<?xml"):
+                lines = lines[1:]
+            xml_output = '<?xml version="1.0" encoding="UTF-8"?>\n' + "\n".join(lines)
+        except Exception:
+            xml_output = '<?xml version="1.0" encoding="UTF-8"?>\n' + raw_xml
+
+        # Save to xml_annotations folder, one file per page image
+        xml_save_path = os.path.join(XML_ANNOTATIONS_FOLDER, f"{safe_image_name}_annotations.xml")
+        with open(xml_save_path, "w", encoding="utf-8") as f:
+            f.write(xml_output)
+        saved_files.append(xml_save_path)
+
+    if not saved_files:
+        return jsonify({"error": "No pages to save"}), 400
+
     try:
-        pretty = minidom.parseString(raw_xml).toprettyxml(indent="  ")
-        # Remove the extra XML declaration added by minidom (we add our own)
-        lines = pretty.split("\n")
-        if lines and lines[0].startswith("<?xml"):
-            lines = lines[1:]
-        xml_output = '<?xml version="1.0" encoding="UTF-8"?>\n' + "\n".join(lines)
-    except Exception:
-        xml_output = '<?xml version="1.0" encoding="UTF-8"?>\n' + raw_xml
+        rel_dir = os.path.relpath(XML_ANNOTATIONS_FOLDER, BASE_DIR)
+    except ValueError:
+        rel_dir = XML_ANNOTATIONS_FOLDER
 
-    safe_name = secure_filename(re.sub(r"[^\w\-.]", "_", doc_filename)) or "document"
-
-    # Save to xml_annotations folder (same pattern as JSON annotations)
-    xml_save_path = os.path.join(XML_ANNOTATIONS_FOLDER, f"{safe_name}_annotations.xml")
-    with open(xml_save_path, "w", encoding="utf-8") as f:
-        f.write(xml_output)
-
-    return Response(
-        xml_output,
-        mimetype="application/xml",
-        headers={"Content-Disposition": f'attachment; filename="{safe_name}_annotations.xml"'},
-    )
+    return jsonify({
+        "success": True,
+        "saved_to": saved_files[0],
+        "saved_to_rel": rel_dir,
+        "saved_files": [os.path.basename(f) for f in saved_files],
+        "num_pages": len(saved_files),
+    })
 
 
 @app.route("/redetect_tables", methods=["POST"])
@@ -753,10 +806,19 @@ def redetect_tables():
                 }
                 for cell in det.cells
             ]
+            # Build content field row-by-row to preserve table structure
+            rows_text = {}
+            for cell in det.cells:
+                if cell.text:
+                    rows_text.setdefault(cell.row, []).append(cell.text)
+            content_str = "\n".join(
+                " | ".join(texts) for texts in sorted(rows_text.items())
+                if (texts := texts[1])
+            ) if rows_text else ""
             table_elements.append({
                 "id": str(uuid.uuid4()),
                 "label": "table",
-                "content": "",
+                "content": content_str,
                 "bbox_norm": bbox_norm,
                 "table_html": det.html,
                 "table_cells": table_cells,
