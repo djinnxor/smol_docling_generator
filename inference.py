@@ -1,6 +1,7 @@
 """
-Run DocTag inference on an image file or a PDF file using
-ibm-granite/granite-docling-258M (or any compatible fine-tuned checkpoint).
+Run DocTag inference on an image file or a PDF file using the locally trained
+model in the doctag_model/ folder (LoRA fine-tune of ibm-granite/granite-docling-258M).
+If that folder is absent the upstream HuggingFace model is used as a fallback.
 
 For each input page the model is prompted with the page image and asked to
 produce a <doctag>…</doctag> string.  Results are printed to stdout by default
@@ -8,15 +9,15 @@ and can optionally be written to a JSON or plain-text file.
 
 Usage examples
 --------------
-# Single image
+# Single image  (uses doctag_model/ automatically)
 python inference.py --input page.png
 
 # Multi-page PDF
 python inference.py --input document.pdf
 
-# Use a locally fine-tuned checkpoint and save output
+# Override the model (any HuggingFace ID or local path)
 python inference.py --input document.pdf \\
-                    --model_id ./doctag_model \\
+                    --model_id ./my_other_model \\
                     --output results.json
 
 # Limit to the first 5 pages, use GPU
@@ -39,7 +40,12 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 # -----------------------------------------------------------------------
 # Constants
 # -----------------------------------------------------------------------
-DEFAULT_MODEL_ID = "ibm-granite/granite-docling-258M"
+# Local folder produced by train.py --output_dir (preferred default)
+LOCAL_DOCTAG_MODEL = "doctag_model"
+# Upstream model used when the local folder is absent
+FALLBACK_MODEL_ID = "ibm-granite/granite-docling-258M"
+# Resolved default: use local folder if it exists, else HuggingFace
+DEFAULT_MODEL_ID = LOCAL_DOCTAG_MODEL if Path(LOCAL_DOCTAG_MODEL).is_dir() else FALLBACK_MODEL_ID
 SYSTEM_PROMPT = "Convert this document page to DocTags format."
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 
@@ -49,12 +55,47 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 # -----------------------------------------------------------------------
 
 def _load_model_and_processor(model_id: str, device: str, dtype: torch.dtype):
-    """Load the processor and model onto *device* with *dtype*."""
-    print(f"Loading model: {model_id}", file=sys.stderr)
-    processor = AutoProcessor.from_pretrained(model_id)
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_id, torch_dtype=dtype
-    ).to(device)
+    """Load the processor and model onto *device* with *dtype*.
+
+    If *model_id* points to a directory that contains ``adapter_config.json``
+    (i.e. a PEFT / LoRA adapter saved by train.py) the base model named inside
+    that config is loaded first, then the LoRA weights are merged into it for
+    efficient inference.  Any other path or HuggingFace model ID is loaded
+    directly with AutoModelForImageTextToText.
+    """
+    model_path = Path(model_id)
+    is_peft_adapter = (model_path / "adapter_config.json").exists()
+
+    if is_peft_adapter:
+        import json as _json
+        try:
+            from peft import PeftModel
+        except ImportError as exc:
+            raise ImportError(
+                "peft is required to load a LoRA adapter. Install it with:\n"
+                "  pip install peft"
+            ) from exc
+
+        with open(model_path / "adapter_config.json", encoding="utf-8") as f:
+            adapter_cfg = _json.load(f)
+        base_model_id = adapter_cfg["base_model_name_or_path"]
+
+        print(f"Loading LoRA adapter from: {model_id}", file=sys.stderr)
+        print(f"  base model: {base_model_id}", file=sys.stderr)
+        processor = AutoProcessor.from_pretrained(model_id)
+        base_model = AutoModelForImageTextToText.from_pretrained(
+            base_model_id, torch_dtype=dtype
+        ).to(device)
+        model = PeftModel.from_pretrained(base_model, model_id)
+        # Merge LoRA weights into the base model for faster inference
+        model = model.merge_and_unload()
+    else:
+        print(f"Loading model: {model_id}", file=sys.stderr)
+        processor = AutoProcessor.from_pretrained(model_id)
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_id, torch_dtype=dtype
+        ).to(device)
+
     model.eval()
     return processor, model
 
@@ -218,7 +259,11 @@ def main() -> None:
     parser.add_argument(
         "--model_id",
         default=DEFAULT_MODEL_ID,
-        help=f"HuggingFace model ID or path to a fine-tuned checkpoint (default: {DEFAULT_MODEL_ID})",
+        help=(
+            "HuggingFace model ID or path to a fine-tuned checkpoint / LoRA adapter. "
+            f"Defaults to '{LOCAL_DOCTAG_MODEL}' (local trained model) when that folder "
+            f"exists, otherwise falls back to '{FALLBACK_MODEL_ID}'."
+        ),
     )
     parser.add_argument(
         "--output",
