@@ -176,13 +176,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--xml_dir",
-        default="dataset/xml_annotations",
-        help="Directory containing XML annotation files (default: dataset/xml_annotations)",
+        default="labeler_data/xml_annotations",
+        help="Directory containing XML annotation files (default: labeler_data/xml_annotations)",
     )
     parser.add_argument(
         "--images_dir",
-        default="dataset/uploads",
-        help="Directory containing page PNG images (default: dataset/uploads)",
+        default="labeler_data/uploads",
+        help="Directory containing page PNG images (default: labeler_data/uploads)",
     )
     parser.add_argument(
         "--output",
@@ -192,8 +192,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--split_ratio",
         type=float,
-        default=0.9,
-        help="Fraction of data used for training; remainder goes to validation (default: 0.9)",
+        default=0.8,
+        help="Fraction of data used for training; remainder goes to validation (default: 0.8)",
     )
     args = parser.parse_args()
 
