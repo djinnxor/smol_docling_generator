@@ -234,7 +234,7 @@ def main() -> None:
         help="Gradient accumulation steps (default: 4)",
     )
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (default: 2e-5)")
-    parser.add_argument("--max_length", type=int, default=4096, help="Maximum token length (default: 4096)")
+    parser.add_argument("--max_length", type=int, default=2048, help="Maximum token length (default: 2048)")
     parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (recommended)")
     parser.add_argument(
@@ -327,6 +327,8 @@ def main() -> None:
         report_to="none",
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
     trainer = Trainer(
