@@ -307,8 +307,8 @@ def process_with_docling(pdf_path):
                 if thtml:
                     element["table_html"] = thtml
                 cell_bboxes = _extract_table_cell_bboxes(item, pd["width"], pd["height"])
-                if cell_bboxes:
-                    element["table_cells"] = cell_bboxes
+                # if cell_bboxes:
+                #     element["table_cells"] = cell_bboxes
             elements_by_page.setdefault(page_no, []).append(element)
 
     return elements_by_page, page_dims
@@ -812,8 +812,9 @@ def redetect_tables():
                 if cell.text:
                     rows_text.setdefault(cell.row, []).append(cell.text)
             content_str = "\n".join(
-                " | ".join(texts) for texts in sorted(rows_text.items())
-                if (texts := texts[1])
+                " | ".join(row_texts)
+                for row_index, row_texts in sorted(rows_text.items())
+                if row_texts
             ) if rows_text else ""
             table_elements.append({
                 "id": str(uuid.uuid4()),
@@ -821,7 +822,7 @@ def redetect_tables():
                 "content": content_str,
                 "bbox_norm": bbox_norm,
                 "table_html": det.html,
-                "table_cells": table_cells,
+                #"table_cells": table_cells,
             })
 
         return jsonify({

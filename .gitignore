@@ -1,6 +1,7 @@
 # Labeler runtime data (uploads and saved annotations)
 labeler_data/uploads/
 labeler_data/annotations/
+labeler_data/xml_annotations/
 
 # Python
 __pycache__/
@@ -15,3 +16,5 @@ build/
 .DS_Store
 
 smold/
+venv/
+output_version2/
