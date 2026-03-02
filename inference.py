@@ -36,12 +36,11 @@ from pathlib import Path
 import torch
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
+from build_document import parse_doctag, render_doctag, save_output  
 
-# -----------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------
+
 # Local folder produced by train.py --output_dir (preferred default)
-LOCAL_DOCTAG_MODEL = "doctag_model"
+LOCAL_DOCTAG_MODEL = "doctag_modelsad"
 # Upstream model used when the local folder is absent
 FALLBACK_MODEL_ID = "ibm-granite/granite-docling-258M"
 # Resolved default: use local folder if it exists, else HuggingFace
@@ -49,10 +48,6 @@ DEFAULT_MODEL_ID = LOCAL_DOCTAG_MODEL if Path(LOCAL_DOCTAG_MODEL).is_dir() else 
 SYSTEM_PROMPT = "Convert this document page to DocTags format."
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 
-
-# -----------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------
 
 def _load_model_and_processor(model_id: str, device: str, dtype: torch.dtype):
     """Load the processor and model onto *device* with *dtype*.
@@ -68,13 +63,7 @@ def _load_model_and_processor(model_id: str, device: str, dtype: torch.dtype):
 
     if is_peft_adapter:
         import json as _json
-        try:
-            from peft import PeftModel
-        except ImportError as exc:
-            raise ImportError(
-                "peft is required to load a LoRA adapter. Install it with:\n"
-                "  pip install peft"
-            ) from exc
+        from peft import PeftModel
 
         with open(model_path / "adapter_config.json", encoding="utf-8") as f:
             adapter_cfg = _json.load(f)
@@ -203,11 +192,25 @@ def run_inference(
         )
 
     results: list[dict] = []
+    doctags = []
     total = len(images)
     for i, img in enumerate(images, 1):
         print(f"Processing page {i}/{total} …", file=sys.stderr)
         doctag = _infer_page(img, processor, model, device, max_new_tokens)
         results.append({"page": i, "doctag": doctag})
+        doctags.append(doctag)
+
+    images = []
+    for i, dt in enumerate(doctags):
+        img = render_doctag(dt, 1240, 1754, 20)
+        images.append(img)
+        print(f"  Page {i + 1}: {len(parse_doctag(dt))} elements")
+    
+    fmt = "pdf" if len(images) > 1 else "png"
+    written = save_output(images, "doctag_render.png", fmt)
+    for fp in written:
+        print(f"  → {fp}")
+    print("Done.")
 
     # Save / print
     if output_path is not None:
