@@ -269,7 +269,11 @@ def main() -> None:
         if args.bf16
         else (torch.float16 if args.fp16 else torch.float32)
     )
-    model = AutoModelForImageTextToText.from_pretrained(args.model_id, torch_dtype=torch_dtype)
+    model = AutoModelForImageTextToText.from_pretrained(args.model_id, dtype=torch_dtype)
+    # Gradient checkpointing (enabled below) is incompatible with use_cache.
+    # Set it explicitly here so the Trainer does not emit a warning and the
+    # model behaves consistently during both training and evaluation.
+    model.config.use_cache = False
 
     # ------------------------------------------------------------------
     # Optionally apply LoRA
