@@ -40,13 +40,8 @@ from transformers import (
 # Default model to fine-tune
 DEFAULT_MODEL_ID = "ibm-granite/granite-docling-258M"
 
-# Prompt sent to the model together with each page image
 SYSTEM_PROMPT = "Convert this document page to DocTags format."
 
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
 
 class DocTagDataset(Dataset):
     """
@@ -60,7 +55,7 @@ class DocTagDataset(Dataset):
     is computed only on the assistant's DocTag output.
     """
 
-    def __init__(self, jsonl_path: str, processor, max_length: int = 4096):
+    def __init__(self, jsonl_path: str, processor, max_length: int = 1024):
         self.records: list[dict] = []
         with open(jsonl_path, encoding="utf-8") as f:
             for line in f:
@@ -114,7 +109,7 @@ class DocTagDataset(Dataset):
         prompt_ids = self.processor.tokenizer(
             text_prompt,
             add_special_tokens=False,
-            truncation=True,
+            truncation=False,
             max_length=self.max_length,
         ).input_ids
 
@@ -123,7 +118,7 @@ class DocTagDataset(Dataset):
             images=image,
             text=text_full,
             return_tensors="pt",
-            truncation=True,
+            truncation=False,
             max_length=self.max_length,
         )
 
@@ -138,10 +133,6 @@ class DocTagDataset(Dataset):
         inputs["labels"] = labels
         return inputs
 
-
-# ---------------------------------------------------------------------------
-# Data collator
-# ---------------------------------------------------------------------------
 
 def doctag_data_collator(features: list[dict]) -> dict:
     """
@@ -192,10 +183,6 @@ def doctag_data_collator(features: list[dict]) -> dict:
     return batch
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fine-tune ibm-granite/granite-docling-258M for DocTag generation"
@@ -230,11 +217,11 @@ def main() -> None:
     parser.add_argument(
         "--grad_accum",
         type=int,
-        default=4,
-        help="Gradient accumulation steps (default: 4)",
+        default=2,
+        help="Gradient accumulation steps (default: 2)",
     )
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (default: 2e-5)")
-    parser.add_argument("--max_length", type=int, default=2048, help="Maximum token length (default: 2048)")
+    parser.add_argument("--max_length", type=int, default=1024, help="Maximum token length (default: 1024)")
     parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (recommended)")
     parser.add_argument(
@@ -255,12 +242,8 @@ def main() -> None:
     if not Path(args.train_data).exists():
         raise FileNotFoundError(
             f"Training data not found: {args.train_data}\n"
-            "Run prepare_dataset.py first."
         )
-
-    # ------------------------------------------------------------------
-    # Load processor and model
-    # ------------------------------------------------------------------
+    
     print(f"Loading processor and model: {args.model_id}")
     processor = AutoProcessor.from_pretrained(args.model_id)
 
@@ -271,9 +254,6 @@ def main() -> None:
     )
     model = AutoModelForImageTextToText.from_pretrained(args.model_id, torch_dtype=torch_dtype)
 
-    # ------------------------------------------------------------------
-    # Optionally apply LoRA
-    # ------------------------------------------------------------------
     if args.lora:
         try:
             from peft import LoraConfig, TaskType, get_peft_model
@@ -294,9 +274,6 @@ def main() -> None:
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-    # ------------------------------------------------------------------
-    # Build datasets
-    # ------------------------------------------------------------------
     print("Building datasets …")
     train_dataset = DocTagDataset(args.train_data, processor, args.max_length)
 
@@ -307,9 +284,6 @@ def main() -> None:
     else:
         print(f"Train: {len(train_dataset)} samples | No validation file found at {args.val_data}")
 
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -342,9 +316,6 @@ def main() -> None:
     print("Starting training …")
     trainer.train()
 
-    # ------------------------------------------------------------------
-    # Save
-    # ------------------------------------------------------------------
     print(f"Saving fine-tuned model to {args.output_dir}")
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
