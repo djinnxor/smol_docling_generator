@@ -49,6 +49,40 @@ SYSTEM_PROMPT = "Convert this document page to DocTags format."
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
 
 
+def _resolve_device_dtype(device: str, dtype: torch.dtype | None) -> tuple[str, torch.dtype]:
+    """Pick the best available device and matching dtype when not specified by the caller.
+
+    Priority: CUDA > MPS > CPU.  bf16 is preferred on CUDA (Ampere+) and CPU
+    when the hardware supports it; fp16 is used on MPS; fp32 is the safe fallback.
+    """
+    if device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
+    if dtype is None:
+        if device.startswith("cuda"):
+            # bf16 is the fastest safe dtype on Ampere+ GPUs (compute ≥ 8.0).
+            # fp16 is safe on Pascal+ (compute ≥ 6.0).  Fall back to fp32 on
+            # anything older to avoid unsupported-dtype errors.
+            cap = torch.cuda.get_device_capability()
+            if torch.cuda.is_bf16_supported():
+                dtype = torch.bfloat16
+            elif cap[0] >= 6:
+                dtype = torch.float16
+            else:
+                dtype = torch.float32
+        elif device == "mps":
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
+    return device, dtype
+
+
 def _load_model_and_processor(model_id: str, device: str, dtype: torch.dtype):
     """Load the processor and model onto *device* with *dtype*.
 
@@ -85,6 +119,7 @@ def _load_model_and_processor(model_id: str, device: str, dtype: torch.dtype):
             model_id, torch_dtype=dtype
         ).to(device)
 
+    model.config.use_cache = True
     model.eval()
     return processor, model
 
@@ -132,11 +167,12 @@ def _infer_page(
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    with torch.no_grad():
+    with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
+            use_cache=True,
         )
 
     # Decode only the newly generated tokens (skip the prompt)
@@ -157,10 +193,10 @@ def run_inference(
     input_path: str,
     model_id: str = DEFAULT_MODEL_ID,
     output_path: str | None = None,
-    device: str = "cpu",
-    dtype: torch.dtype = torch.float32,
-    max_new_tokens: int = 4096,
-    dpi: int = 150,
+    device: str = "auto",
+    dtype: torch.dtype | None = None,
+    max_new_tokens: int = 1536,  # ~8% headroom above the observed 1420-token max
+    dpi: int = 96,
     max_pages: int | None = None,
 ) -> list[dict]:
     """
@@ -177,6 +213,7 @@ def run_inference(
     input_path = str(input_path)
     suffix = Path(input_path).suffix.lower()
 
+    device, dtype = _resolve_device_dtype(device, dtype)
     processor, model = _load_model_and_processor(model_id, device, dtype)
 
     # Collect page images
@@ -279,30 +316,33 @@ def main() -> None:
     )
     parser.add_argument(
         "--device",
-        default="cpu",
-        help="Device to run inference on: 'cpu', 'cuda', 'cuda:0', 'mps', etc. (default: cpu)",
+        default="auto",
+        help=(
+            "Device to run inference on: 'auto' (default), 'cpu', 'cuda', 'cuda:0', 'mps', etc. "
+            "'auto' picks CUDA if available, then MPS, then CPU."
+        ),
     )
     parser.add_argument(
         "--bf16",
         action="store_true",
-        help="Use bfloat16 precision (recommended for CUDA GPUs that support it)",
+        help="Force bfloat16 precision (auto-selected on CUDA when supported)",
     )
     parser.add_argument(
         "--fp16",
         action="store_true",
-        help="Use float16 precision",
+        help="Force float16 precision",
     )
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=4096,
-        help="Maximum number of tokens to generate per page (default: 4096)",
+        default=1536,
+        help="Maximum number of tokens to generate per page (default: 1536)",
     )
     parser.add_argument(
         "--dpi",
         type=int,
-        default=150,
-        help="DPI used when converting PDF pages to images (default: 150)",
+        default=96,
+        help="DPI used when converting PDF pages to images (default: 96)",
     )
     parser.add_argument(
         "--pages",
@@ -315,10 +355,11 @@ def main() -> None:
     if not Path(args.input).exists():
         parser.error(f"Input file not found: {args.input}")
 
-    dtype = (
+    # Let _resolve_device_dtype auto-select dtype unless the user forced one
+    dtype: torch.dtype | None = (
         torch.bfloat16
         if args.bf16
-        else (torch.float16 if args.fp16 else torch.float32)
+        else (torch.float16 if args.fp16 else None)
     )
 
     run_inference(
