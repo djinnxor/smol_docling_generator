@@ -109,7 +109,7 @@ class DocTagDataset(Dataset):
         prompt_ids = self.processor.tokenizer(
             text_prompt,
             add_special_tokens=False,
-            truncation=True,
+            truncation=False,
             max_length=self.max_length,
         ).input_ids
 
@@ -118,7 +118,7 @@ class DocTagDataset(Dataset):
             images=image,
             text=text_full,
             return_tensors="pt",
-            truncation=True,
+            truncation=False,
             max_length=self.max_length,
         )
 

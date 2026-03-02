@@ -40,7 +40,7 @@ from build_document import parse_doctag, render_doctag, save_output
 
 
 # Local folder produced by train.py --output_dir (preferred default)
-LOCAL_DOCTAG_MODEL = "doctag_modelsad"
+LOCAL_DOCTAG_MODEL = "doctag_models"
 # Upstream model used when the local folder is absent
 FALLBACK_MODEL_ID = "ibm-granite/granite-docling-258M"
 # Resolved default: use local folder if it exists, else HuggingFace
@@ -63,7 +63,13 @@ def _load_model_and_processor(model_id: str, device: str, dtype: torch.dtype):
 
     if is_peft_adapter:
         import json as _json
-        from peft import PeftModel
+        try:
+            from peft import PeftModel
+        except ImportError as exc:
+            raise ImportError(
+                "peft is required to load a LoRA adapter. Install it with:\n"
+                "  pip install peft"
+            ) from exc
 
         with open(model_path / "adapter_config.json", encoding="utf-8") as f:
             adapter_cfg = _json.load(f)
@@ -73,8 +79,14 @@ def _load_model_and_processor(model_id: str, device: str, dtype: torch.dtype):
         print(f"  base model: {base_model_id}", file=sys.stderr)
         processor = AutoProcessor.from_pretrained(model_id)
         base_model = AutoModelForImageTextToText.from_pretrained(
-            base_model_id, torch_dtype=dtype
-        ).to(device)
+            base_model_id, dtype=dtype
+        )
+
+        # Resize embeddings to match the processor's vocabulary (which may
+        # include extra special tokens added during fine-tuning).
+        base_model.resize_token_embeddings(len(processor.tokenizer))
+
+        base_model = base_model.to(device)
         model = PeftModel.from_pretrained(base_model, model_id)
         # Merge LoRA weights into the base model for faster inference
         model = model.merge_and_unload()
@@ -82,7 +94,7 @@ def _load_model_and_processor(model_id: str, device: str, dtype: torch.dtype):
         print(f"Loading model: {model_id}", file=sys.stderr)
         processor = AutoProcessor.from_pretrained(model_id)
         model = AutoModelForImageTextToText.from_pretrained(
-            model_id, torch_dtype=dtype
+            model_id, dtype=dtype
         ).to(device)
 
     model.eval()
