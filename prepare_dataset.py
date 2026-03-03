@@ -361,7 +361,7 @@ def _coco_annotations_to_otsl(
     if not cols_raw:
         return None
 
-    # Build the unified row list: (x1, y1, x2, y2, is_header).
+    # Build the unified row list: (xspans_raw1, y1, x2, y2, is_header).
     # A class-0 row is a header if it overlaps a class-3 header region.
     # Class-3 header regions that don't overlap any class-0 row are inserted
     # as standalone header rows (some annotators label the header separately).
@@ -439,37 +439,12 @@ def _coco_annotations_to_otsl(
 
 
 def coco_table_to_doctag_dataset(
-    labels_dir: str,
-    images_dir: str,
+    labels_dir: str = "60/labels",
+    images_dir: str = "60/images",
     output_path: str = "coco_table_training_data.jsonl",
-    split_ratio: float = 0.9,
+    split_ratio: float = 0.8,
 ) -> tuple[str | None, str | None]:
-    """Convert COCO-style table-structure annotations to DocTag OTSL format and
-    write train / validation JSONL files ready for fine-tuning.
 
-    The *labels_dir* directory must contain ``.txt`` files where each line has
-    the form::
-
-        <class_id> <cx> <cy> <w> <h>
-
-    with normalised (0–1) coordinates in COCO center format and class IDs:
-
-    * 0 = table-row
-    * 1 = table-column
-    * 2 = table-spanning-cell
-    * 3 = table-column-header
-
-    Each label file must share its stem with a matching image file (PNG/JPG/JPEG)
-    in *images_dir*.  Label files whose matching image cannot be found are
-    skipped with a warning.
-
-    Output JSONL schema (one JSON object per line)::
-
-        {"image": "<absolute path>", "doctag": "<doctag string>"}
-
-    Returns ``(train_path, val_path)``.  *val_path* is ``None`` when there are
-    too few records to split.
-    """
     labels_dir_path = Path(labels_dir)
     txt_files = sorted(labels_dir_path.glob("*.txt"))
     if not txt_files:
