@@ -20,6 +20,9 @@ import json
 import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from sklearn.model_selection import train_test_split
+import xml.etree.ElementTree as ET
+
 
 # Scale used for <loc_N> tokens  (SmolDocling default: 500)
 LOC_SCALE = 500
@@ -59,6 +62,9 @@ def _bbox_to_loc(x1: float, y1: float, x2: float, y2: float, scale: int = LOC_SC
 
 def _element_to_doctag(tag: str, lx1: int, ly1: int, lx2: int, ly2: int, content: str) -> str:
     """Render a single document element as a DocTag string."""
+    if tag == "otsl":
+        # OTSL tables have their own special format and ignore content
+        return table_xml_to_doctag_from_str(content)
     loc = f"<loc_{lx1}><loc_{ly1}><loc_{lx2}><loc_{ly2}>"
     content = content.strip().replace("\n", " ") if content else ""
     if tag == "picture":
@@ -66,6 +72,109 @@ def _element_to_doctag(tag: str, lx1: int, ly1: int, lx2: int, ly2: int, content
         return f"<{tag}>{loc}</{tag}>"
     return f"<{tag}>{loc}{content}</{tag}>"
 
+def table_xml_to_doctag(table_elem, scale=500):
+    """
+    Convert an XML <table> element to DocTag format.
+    Preserves all rows, columns, and cells (including empty).
+    """
+    # Get table bbox
+    bbox_x1 = float(table_elem.attrib.get("bbox_x1", 0))
+    bbox_y1 = float(table_elem.attrib.get("bbox_y1", 0))
+    bbox_x2 = float(table_elem.attrib.get("bbox_x2", 1))
+    bbox_y2 = float(table_elem.attrib.get("bbox_y2", 1))
+
+    # Scale bbox to DocTag loc tokens
+    def loc(val): return int(round(val * scale))
+    loc_str = (
+        f"<loc_{loc(bbox_x1)}><loc_{loc(bbox_y1)}>"
+        f"<loc_{loc(bbox_x2)}><loc_{loc(bbox_y2)}>"
+    )
+
+    # Parse table rows/cells
+    rows = []
+    # Find the nested <table> inside the outer <table>
+    inner_table = table_elem.find("table")
+    if inner_table is None:
+        inner_table = table_elem  # fallback: treat as flat table
+
+    for tr in inner_table.findall("tr"):
+        row_cells = []
+        for cell in tr:
+            tag = cell.tag  # td or th
+            text = (cell.text or "").strip()
+            row_cells.append(f"<{tag}>{text}</{tag}>")
+        rows.append("<row>" + "".join(row_cells) + "</row>")
+
+    table_content = "".join(rows)
+
+    # Compose DocTag
+    doctag = f"<otsl>{loc_str}{table_content}</otsl>"
+    return doctag
+
+def table_xml_to_doctag_from_str(table_str, scale=500):
+    """Parse table XML string and convert to DocTag."""
+    table_elem = ET.fromstring(table_str)
+    return table_xml_to_template_doctag(table_elem, scale=scale)
+
+def table_xml_to_template_doctag(table_elem, scale=500):
+    """
+    Convert an XML <table> element to DocTag template with cspan/rspan for colspan/rowspan.
+    """
+    bbox_x1 = float(table_elem.attrib.get("bbox_x1", 0))
+    bbox_y1 = float(table_elem.attrib.get("bbox_y1", 0))
+    bbox_x2 = float(table_elem.attrib.get("bbox_x2", 1))
+    bbox_y2 = float(table_elem.attrib.get("bbox_y2", 1))
+
+    def loc(val): return int(round(val * scale))
+    loc_str = (
+        f"<loc_{loc(bbox_x1)}><loc_{loc(bbox_y1)}>"
+        f"<loc_{loc(bbox_x2)}><loc_{loc(bbox_y2)}>"
+    )
+
+    inner_table = table_elem.find("table")
+    if inner_table is None:
+        inner_table = table_elem
+
+    rows = inner_table.findall("tr")
+    doctag_rows = []
+
+    # Header row
+    header_cells = rows[0]
+    header_tags = []
+    for cell in header_cells:
+        text = (cell.text or "").strip()
+        cspan = cell.attrib.get("colspan")
+        rspan = cell.attrib.get("rowspan")
+        span_str = ""
+        if cspan:
+            span_str += f' cspan="{cspan}"'
+        if rspan:
+            span_str += f' rspan="{rspan}"'
+        header_tags.append(f"<ched{span_str}>{text}")
+    doctag_rows.append("".join(header_tags) + "<nl>")
+
+    # Data rows
+    for tr in rows[1:]:
+        row_tags = []
+        first_cell = True
+        for cell in tr:
+            text = (cell.text or "").strip()
+            cspan = cell.attrib.get("colspan")
+            rspan = cell.attrib.get("rowspan")
+            span_str = ""
+            if cspan:
+                span_str += f' cspan="{cspan}"'
+            if rspan:
+                span_str += f' rspan="{rspan}"'
+            if first_cell:
+                row_tags.append(f"<rhed{span_str}>{text}")
+                first_cell = False
+            else:
+                row_tags.append(f"<fcel{span_str}>{text}")
+        doctag_rows.append("".join(row_tags) + "<nl>")
+
+    doctag = f"<otsl>{loc_str}{''.join(doctag_rows)}</otsl>"
+    return doctag
 
 def xml_to_doctag_pairs(xml_path: str, images_dir: str):
     """
@@ -95,7 +204,6 @@ def xml_to_doctag_pairs(xml_path: str, images_dir: str):
         for child in page:
             tag = child.tag
             doctag_tag = LABEL_TO_DOCTAG.get(tag, tag)
-            content = (child.text or "").strip()
 
             try:
                 x1 = float(child.get("bbox_x1", 0))
@@ -106,6 +214,13 @@ def xml_to_doctag_pairs(xml_path: str, images_dir: str):
                 continue
 
             lx1, ly1, lx2, ly2 = _bbox_to_loc(x1, y1, x2, y2)
+
+            # For tables, pass the full XML string (including children)
+            if doctag_tag == "otsl":
+                content = ET.tostring(child, encoding="unicode")
+            else:
+                content = (child.text or "").strip()
+
             element_strings.append(_element_to_doctag(doctag_tag, lx1, ly1, lx2, ly2, content))
 
         if not element_strings:
@@ -144,10 +259,10 @@ def prepare_dataset(
         print("No records found. Check that XML annotation files and page images are present.")
         return None, None
 
-    split_idx = max(1, int(len(records) * split_ratio))
-    train_records = records[:split_idx]
-    val_records = records[split_idx:]
-
+    train_records, val_records = train_test_split(
+        records, test_size=1 - split_ratio, random_state=42
+    )
+    
     base = output_path.replace(".jsonl", "")
     train_path = f"{base}_train.jsonl"
     val_path = f"{base}_val.jsonl"

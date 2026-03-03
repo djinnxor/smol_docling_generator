@@ -40,7 +40,7 @@ from build_document import parse_doctag, render_doctag, save_output
 
 
 # Local folder produced by train.py --output_dir (preferred default)
-LOCAL_DOCTAG_MODEL = "doctag_models"
+LOCAL_DOCTAG_MODEL = "doctag_model"
 # Upstream model used when the local folder is absent
 FALLBACK_MODEL_ID = "ibm-granite/granite-docling-258M"
 # Resolved default: use local folder if it exists, else HuggingFace
@@ -256,7 +256,10 @@ def run_inference(
         print(f"  Page {i + 1}: {len(parse_doctag(dt))} elements")
     
     fmt = "pdf" if len(images) > 1 else "png"
-    written = save_output(images, "doctag_render.png", fmt)
+    if fmt == "pdf":
+        written = save_output(images, "doctag_render.pdf", fmt)
+    else:
+        written = save_output(images, "doctag_render.png", fmt)
     for fp in written:
         print(f"  → {fp}")
     print("Done.")
@@ -328,10 +331,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--device",
-        default="auto",
+        default="cpu",
         help=(
-            "Device to run inference on: 'auto' (default), 'cpu', 'cuda', 'cuda:0', 'mps', etc. "
-            "'auto' picks CUDA if available, then MPS, then CPU."
+            "Device to run inference on: 'cpu', 'cuda', 'cuda:0', 'mps', etc. "
+            "Defaults to 'cpu'."
         ),
     )
     parser.add_argument(
