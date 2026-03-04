@@ -172,9 +172,7 @@ def test_save_jsonl():
         "<doctag><text><loc_0><loc_0><loc_100><loc_50>Сайн байна уу</text></doctag>",
         "<doctag><title><loc_0><loc_0><loc_500><loc_30>Гарчиг</title></doctag>",
     ]
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".jsonl", delete=False,
-    ) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
         tmp_path = f.name
 
     try:
@@ -192,9 +190,7 @@ def test_save_jsonl():
 def test_save_jsonl_with_source():
     doctags = ["<doctag><text><loc_0><loc_0><loc_100><loc_50>Translated</text></doctag>"]
     sources = ["<doctag><text><loc_0><loc_0><loc_100><loc_50>Original</text></doctag>"]
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".jsonl", delete=False,
-    ) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
         tmp_path = f.name
 
     try:

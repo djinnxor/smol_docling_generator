@@ -353,7 +353,7 @@ def _load_via_parquet(
     """
     try:
         from huggingface_hub import HfFileSystem
-        import pyarrow.parquet as pq  # noqa: F811
+        import pyarrow.parquet as pq
     except ImportError:
         return None
 
