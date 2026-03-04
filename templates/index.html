@@ -502,6 +502,10 @@
 <div id="import-folder-panel" style="display:none">
   <span style="font-size:.82rem;white-space:nowrap">Folder path:</span>
   <input type="text" id="import-folder-path" placeholder="e.g. 60  or  /abs/path/to/folder" />
+  <label style="font-size:.82rem;white-space:nowrap;display:flex;align-items:center;gap:4px;cursor:pointer" title="Also run Docling on each image to detect text, titles and other non-table elements">
+    <input type="checkbox" id="import-folder-docling" />
+    Detect other elements (Docling)
+  </label>
   <button class="btn btn-primary" onclick="importFolder()">Load</button>
   <button class="btn btn-secondary" onclick="document.getElementById('import-folder-panel').style.display='none'">✕</button>
 </div>
@@ -1895,17 +1899,20 @@ async function importFolder() {
   const folderPath = document.getElementById('import-folder-path').value.trim();
   if (!folderPath) { toast('Please enter a folder path.', 'error'); return; }
 
+  const runDocling = document.getElementById('import-folder-docling').checked;
+
   document.getElementById('import-folder-panel').style.display = 'none';
-  showSpinner('Importing folder…');
+  showSpinner(runDocling ? 'Importing folder + running Docling…' : 'Importing folder…');
   try {
     const resp = await fetch('/import_folder', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ folder_path: folderPath }),
+      body: JSON.stringify({ folder_path: folderPath, run_docling: runDocling }),
     });
     const data = await resp.json();
     hideSpinner();
     if (data.error) { toast(data.error, 'error'); setStatus(data.error, 'error'); return; }
+    if (data.docling_warning) toast('⚠ ' + data.docling_warning, '');
 
     // Populate state (same as processPDF)
     state.filename    = data.filename;
@@ -1928,7 +1935,7 @@ async function importFolder() {
     const total = Object.values(state.pages).reduce((s, a) => s + a.length, 0);
     setStatus(
       `Imported: ${data.filename} (${data.num_pages} image${data.num_pages > 1 ? 's' : ''}, ` +
-      `${total} table${total !== 1 ? 's' : ''})`, 'ok'
+      `${total} element${total !== 1 ? 's' : ''})`, 'ok'
     );
     loadPage(1);
     buildLegend();
