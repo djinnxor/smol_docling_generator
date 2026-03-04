@@ -15,6 +15,9 @@ build/
 # macOS
 .DS_Store
 
+# Docker / environment secrets
+.env
+
 smold/
 venv/
 output_version2/

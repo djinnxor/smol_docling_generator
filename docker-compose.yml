@@ -1,0 +1,29 @@
+# docker-compose.yml – one-command startup for the Docling Tag Labeler
+#
+# Usage:
+#   docker compose up --build        # first run (builds the image)
+#   docker compose up                # subsequent runs (skips rebuild)
+#   docker compose down              # stop and remove container
+#
+# The labeler_data/ directory on your machine is mounted into the container
+# so uploads, annotations, and exported XML files persist across restarts.
+
+services:
+  labeler:
+    build: .
+    image: smol-docling-labeler
+    container_name: smol-docling-labeler
+    ports:
+      # Host port 5000 → container port 5000.
+      # Change the left side (e.g. "8080:5000") if port 5000 is already used.
+      - "5000:5000"
+    volumes:
+      # Persist uploads, annotations and exported XML on the host machine.
+      - ./labeler_data/uploads:/app/labeler_data/uploads
+      - ./labeler_data/annotations:/app/labeler_data/annotations
+      - ./labeler_data/xml_annotations:/app/labeler_data/xml_annotations
+    environment:
+      # Optional: set your Google Cloud Vision API key to enable Google OCR.
+      # Leave blank or remove the line to skip Google OCR.
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+    restart: unless-stopped
