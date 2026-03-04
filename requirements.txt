@@ -8,3 +8,7 @@ torch>=2.0
 transformers>=4.40
 accelerate>=0.26
 peft>=0.10
+
+# Synthetic data generation (generate_synthetic_mn.py)
+datasets>=2.14
+deep-translator>=1.11
