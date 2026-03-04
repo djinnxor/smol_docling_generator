@@ -14,6 +14,7 @@ Options:
 import json
 import os
 import re
+import shutil
 import uuid
 import argparse
 import xml.etree.ElementTree as ET
@@ -323,7 +324,7 @@ def apply_google_ocr_to_elements(elements_by_page, image_paths):
     """
     api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
     ocr = GoogleOCR(api_key=api_key)
-    skip_labels = {"picture"}
+    skip_labels = {"picture", "table"}
 
     for page_no, img_path in enumerate(image_paths, 1):
         page_elements = elements_by_page.get(page_no, [])
@@ -379,7 +380,7 @@ def apply_rapidocr_to_elements(elements_by_page, image_paths):
     import numpy as np
 
     engine = RapidOCR()
-    skip_labels = {"picture"}
+    skip_labels = {"picture", "table"}
 
     for page_no, img_path in enumerate(image_paths, 1):
         page_elements = elements_by_page.get(page_no, [])
@@ -833,6 +834,416 @@ def redetect_tables():
 
     except Exception as e:
         return jsonify({"error": f"Re-detection failed: {e}"}), 500
+
+
+# ---------------------------------------------------------------------------
+# COCO-table helper
+# ---------------------------------------------------------------------------
+
+
+def process_image_with_docling(img_path):
+    """Run docling on a single image file and return non-table elements
+    with normalised (0–1) bounding boxes.
+
+    This is used by /import_folder when ``run_docling=True`` so that text,
+    titles, headers and other non-table elements are included alongside the
+    COCO-derived table elements.
+
+    Returns a list of element dicts (same schema as /process elements), or
+    an empty list when docling is not installed or processing fails.
+    """
+    try:
+        from docling.document_converter import DocumentConverter
+        from docling.datamodel.base_models import InputFormat
+    except ImportError:
+        return []
+
+    try:
+        converter = DocumentConverter(allowed_formats=[InputFormat.IMAGE])
+        result = converter.convert(img_path)
+        doc = result.document
+    except Exception:
+        return []
+
+    # Determine page dimensions (pixels) — docling uses TOPLEFT origin for images
+    page_w, page_h = 0.0, 0.0
+    try:
+        pages_attr = doc.pages
+        if hasattr(pages_attr, "items"):
+            page_items = list(pages_attr.items())
+        elif hasattr(pages_attr, "__iter__"):
+            page_items = list(enumerate(pages_attr, 1))
+        else:
+            page_items = []
+        if page_items:
+            _, first_page = page_items[0]
+            if hasattr(first_page, "size") and first_page.size:
+                page_w = float(getattr(first_page.size, "width", 0))
+                page_h = float(getattr(first_page.size, "height", 0))
+    except Exception:
+        pass
+
+    # Fall back to actual pixel dimensions from the image file
+    if not page_w or not page_h:
+        try:
+            with Image.open(img_path) as pil_img:
+                page_w, page_h = float(pil_img.width), float(pil_img.height)
+        except Exception:
+            return []
+
+    elements = []
+    try:
+        for item, _level in doc.iterate_items():
+            label = item.label.value if hasattr(item.label, "value") else str(item.label)
+            # Skip table elements – they are supplied by the COCO labels
+            if label == "table":
+                continue
+            if not hasattr(item, "prov") or not item.prov:
+                continue
+            prov_list = item.prov if isinstance(item.prov, list) else [item.prov]
+            for prov in prov_list:
+                raw_bbox = getattr(prov, "bbox", None)
+                if raw_bbox is None:
+                    continue
+                bbox_norm = _bbox_to_norm(raw_bbox, page_w, page_h)
+                if bbox_norm is None:
+                    continue
+                elements.append({
+                    "id": str(uuid.uuid4()),
+                    "label": label,
+                    "content": _get_item_text(item),
+                    "bbox_norm": bbox_norm,
+                })
+    except Exception:
+        pass
+
+    return elements
+
+def _coco_to_table_element(annotations):
+    """Convert a list of (class_id, cx, cy, w, h) COCO table-structure annotations
+    to a labeler element dict containing ``table_html``, ``table_rows``, and
+    ``table_cols``.
+
+    Class IDs:
+      0 = table-row
+      1 = table-column
+      2 = table-spanning-cell  (layout only; cells stay empty)
+      3 = table-column-header
+    """
+    rows_raw = []
+    cols_raw = []
+    header_regions = []
+
+    for cls, cx, cy, w, h in annotations:
+        x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+        if cls == 0:
+            rows_raw.append((x1, y1, x2, y2))
+        elif cls == 1:
+            cols_raw.append((x1, y1, x2, y2))
+        elif cls == 3:
+            header_regions.append((x1, y1, x2, y2))
+
+    if not rows_raw and not header_regions:
+        return None
+    if not cols_raw:
+        return None
+
+    rows_raw.sort(key=lambda b: (b[1] + b[3]) / 2)
+    cols_raw.sort(key=lambda b: (b[0] + b[2]) / 2)
+
+    def _overlaps_y(a, b, threshold=0.3):
+        inter = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+        shorter = min(a[3] - a[1], b[3] - b[1])
+        return shorter > 0 and inter / shorter >= threshold
+
+    # Merge class-0 rows with class-3 header regions; insert unmatched header regions
+    matched_header_idx: set = set()
+    all_rows = []
+    for row_bbox in rows_raw:
+        is_h = False
+        for i, hr in enumerate(header_regions):
+            if _overlaps_y(row_bbox, hr):
+                is_h = True
+                matched_header_idx.add(i)
+        all_rows.append((*row_bbox, is_h))
+    for i, hr in enumerate(header_regions):
+        if i not in matched_header_idx:
+            all_rows.append((*hr, True))
+
+    all_rows.sort(key=lambda r: (r[1] + r[3]) / 2)
+
+    # Table bounding box
+    all_bboxes = [(r[0], r[1], r[2], r[3]) for r in all_rows] + cols_raw
+    tbl_x1 = max(0.0, min(1.0, min(b[0] for b in all_bboxes)))
+    tbl_y1 = max(0.0, min(1.0, min(b[1] for b in all_bboxes)))
+    tbl_x2 = max(0.0, min(1.0, max(b[2] for b in all_bboxes)))
+    tbl_y2 = max(0.0, min(1.0, max(b[3] for b in all_bboxes)))
+
+    n_cols = len(cols_raw)
+
+    # Build empty-cell HTML
+    html_rows = []
+    for row in all_rows:
+        cells = "".join(f"<{'th' if row[4] else 'td'}></{'th' if row[4] else 'td'}>" for _ in range(n_cols))
+        html_rows.append(f"<tr>{cells}</tr>")
+    table_html = "<table>" + "".join(html_rows) + "</table>"
+
+    # Separator positions (image-normalised coords)
+    table_rows = []
+    for i in range(len(all_rows) - 1):
+        mid_y = (all_rows[i][3] + all_rows[i + 1][1]) / 2
+        table_rows.append(round(max(0.0, min(1.0, mid_y)), 4))
+
+    table_cols = []
+    for i in range(len(cols_raw) - 1):
+        mid_x = (cols_raw[i][2] + cols_raw[i + 1][0]) / 2
+        table_cols.append(round(max(0.0, min(1.0, mid_x)), 4))
+
+    return {
+        "id": str(uuid.uuid4()),
+        "label": "table",
+        "content": "",
+        "bbox_norm": {
+            "x1": round(tbl_x1, 4),
+            "y1": round(tbl_y1, 4),
+            "x2": round(tbl_x2, 4),
+            "y2": round(tbl_y2, 4),
+        },
+        "table_html": table_html,
+        "table_rows": table_rows,
+        "table_cols": table_cols,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Import folder of images + COCO table labels
+# ---------------------------------------------------------------------------
+
+@app.route("/import_folder", methods=["POST"])
+def import_folder():
+    """Import all images from a local folder, matching each to a COCO-format
+    .txt label file (same stem) to build table elements.
+
+    Accepts JSON::
+
+        {
+            "folder_path": "/abs/or/relative/path",
+            "run_docling": false   # optional: also detect non-table elements
+        }
+
+    When ``run_docling`` is ``true``, docling is run on every image to detect
+    text, titles, headers and other non-table elements, which are merged
+    alongside the COCO-derived table elements.
+
+    Returns the same JSON structure as ``/process``.
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    folder_path = data.get("folder_path", "").strip()
+    if not folder_path:
+        return jsonify({"error": "folder_path is required"}), 400
+
+    run_docling = bool(data.get("run_docling", False))
+
+    # Resolve relative to BASE_DIR
+    folder = (
+        Path(folder_path) if Path(folder_path).is_absolute()
+        else Path(BASE_DIR) / folder_path
+    )
+    if not folder.exists() or not folder.is_dir():
+        return jsonify({"error": f"Folder not found: {folder_path}"}), 400
+
+    image_extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
+    img_files = sorted(
+        p for p in folder.iterdir() if p.suffix.lower() in image_extensions
+    )
+    if not img_files:
+        return jsonify({"error": "No image files found in folder"}), 400
+
+    pages = []
+    docling_warning = None
+    for page_no, img_file in enumerate(img_files, 1):
+        dest_name = secure_filename(img_file.name)
+        dest_path = os.path.join(UPLOAD_FOLDER, dest_name)
+        # Copy only if missing or size differs
+        if not os.path.exists(dest_path) or os.path.getsize(dest_path) != img_file.stat().st_size:
+            shutil.copy2(str(img_file), dest_path)
+
+        try:
+            with Image.open(dest_path) as pil_img:
+                img_w, img_h = pil_img.size
+        except Exception:
+            img_w, img_h = 0, 0
+
+        # Non-table elements from docling (optional)
+        elements = []
+        if run_docling:
+            try:
+                docling_elements = process_image_with_docling(dest_path)
+                elements.extend(docling_elements)
+            except Exception as exc:
+                if docling_warning is None:
+                    docling_warning = f"Docling processing failed: {exc}"
+
+        # Parse optional COCO label file and append table element(s)
+        txt_file = folder / (img_file.stem + ".txt")
+        if txt_file.exists():
+            annotations = []
+            with open(txt_file, encoding="utf-8") as fh:
+                for line in fh:
+                    parts = line.strip().split()
+                    if len(parts) != 5:
+                        continue
+                    try:
+                        cls = int(parts[0])
+                        cx, cy, w, h = (
+                            float(parts[1]), float(parts[2]),
+                            float(parts[3]), float(parts[4]),
+                        )
+                        annotations.append((cls, cx, cy, w, h))
+                    except ValueError:
+                        continue
+            if annotations:
+                el = _coco_to_table_element(annotations)
+                if el:
+                    elements.append(el)
+
+        pages.append({
+            "page_num": page_no,
+            "image_url": f"/page_image/{dest_name}",
+            "width": img_w,
+            "height": img_h,
+            "elements": elements,
+        })
+
+    resp = {
+        "filename": folder.name,
+        "pdf_filename": "",
+        "num_pages": len(pages),
+        "pages": pages,
+    }
+    if docling_warning:
+        resp["docling_warning"] = docling_warning
+    return jsonify(resp)
+
+
+# ---------------------------------------------------------------------------
+# OCR all cells in a table element
+# ---------------------------------------------------------------------------
+
+@app.route("/ocr_table_cells", methods=["POST"])
+def ocr_table_cells():
+    """Run Google OCR on every cell of a table element and return updated HTML.
+
+    Accepts JSON::
+
+        {
+            "image_filename": "image.jpg",
+            "bbox_norm": {"x1": ..., "y1": ..., "x2": ..., "y2": ...},
+            "table_rows": [y1, y2, ...],   # separator y-positions (normalised)
+            "table_cols": [x1, x2, ...],   # separator x-positions (normalised)
+            "table_html": "<table>...</table>"  # current HTML (preserves header tags)
+        }
+
+    Returns::
+
+        { "table_html": "<table>...</table>" }
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    image_filename = data.get("image_filename", "")
+    bbox_norm = data.get("bbox_norm", {})
+    table_rows_sep = data.get("table_rows", [])
+    table_cols_sep = data.get("table_cols", [])
+    table_html_in = data.get("table_html", "")
+
+    if not image_filename:
+        return jsonify({"error": "image_filename is required"}), 400
+
+    img_path = os.path.join(UPLOAD_FOLDER, secure_filename(Path(image_filename).name))
+    if not os.path.exists(img_path):
+        return jsonify({"error": f"Image not found: {image_filename}"}), 404
+
+    try:
+        img = Image.open(img_path)
+        img_w, img_h = img.size
+
+        tbl_x1 = bbox_norm.get("x1", 0)
+        tbl_y1 = bbox_norm.get("y1", 0)
+        tbl_x2 = bbox_norm.get("x2", 1)
+        tbl_y2 = bbox_norm.get("y2", 1)
+
+        row_bounds = [tbl_y1] + list(table_rows_sep) + [tbl_y2]
+        col_bounds = [tbl_x1] + list(table_cols_sep) + [tbl_x2]
+        n_rows = len(row_bounds) - 1
+        n_cols = len(col_bounds) - 1
+
+        # Determine which rows are headers from the existing table_html
+        header_row_indices: set = set()
+        if table_html_in:
+            try:
+                tbl_elem = ET.fromstring(table_html_in)
+                for ri, tr in enumerate(tbl_elem.findall("tr")):
+                    if any(cell.tag == "th" for cell in tr):
+                        header_row_indices.add(ri)
+            except Exception:
+                pass
+
+        api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+        ocr = GoogleOCR(api_key=api_key)
+
+        grid_texts = [["" for _ in range(n_cols)] for _ in range(n_rows)]
+        for ri in range(n_rows):
+            y1_px = int(row_bounds[ri] * img_h)
+            y2_px = int(row_bounds[ri + 1] * img_h)
+            for ci in range(n_cols):
+                x1_px = int(col_bounds[ci] * img_w)
+                x2_px = int(col_bounds[ci + 1] * img_w)
+                if x2_px - x1_px < 4 or y2_px - y1_px < 4:
+                    continue
+                # Small padding to avoid clipping text at cell edges
+                pad = 2
+                x1c = max(0, x1_px - pad)
+                y1c = max(0, y1_px - pad)
+                x2c = min(img_w, x2_px + pad)
+                y2c = min(img_h, y2_px + pad)
+                cropped = img.crop((x1c, y1c, x2c, y2c))
+                tmp_path = os.path.join(UPLOAD_FOLDER, f"_cell_{uuid.uuid4().hex}.png")
+                cropped.save(tmp_path, "PNG")
+                try:
+                    text = ocr.google_vision_ocr(tmp_path)
+                    grid_texts[ri][ci] = text.strip()
+                except Exception:
+                    pass
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+
+        # Build updated table HTML, preserving header designation
+        def _esc(s):
+            return (
+                s.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+
+        html_rows = []
+        for ri in range(n_rows):
+            cells = ""
+            for ci in range(n_cols):
+                tag = "th" if ri in header_row_indices else "td"
+                cells += f"<{tag}>{_esc(grid_texts[ri][ci])}</{tag}>"
+            html_rows.append(f"<tr>{cells}</tr>")
+        new_table_html = "<table>" + "".join(html_rows) + "</table>"
+
+        return jsonify({"table_html": new_table_html})
+
+    except Exception as e:
+        return jsonify({"error": f"OCR failed: {e}"}), 500
 
 
 # ---------------------------------------------------------------------------

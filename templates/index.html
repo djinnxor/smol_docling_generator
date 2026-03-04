@@ -430,6 +430,53 @@
   }
   #empty-state .big-icon { font-size: 3rem; }
   #empty-state p { font-size: .9rem; text-align: center; max-width: 220px; }
+
+  /* Import folder panel */
+  #import-folder-panel {
+    padding: 8px 16px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    align-items: center;
+    gap: 8px;
+  }
+  #import-folder-path {
+    flex: 1;
+    padding: 6px 10px;
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: .82rem;
+  }
+  #import-folder-path:focus { border-color: var(--accent); outline: none; }
+
+  /* Table structure editor */
+  #table-struct-section {
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+    margin-top: 8px;
+  }
+  .table-struct-header {
+    font-size: .82rem;
+    font-weight: 600;
+    color: var(--text2);
+    margin-bottom: 6px;
+  }
+  #table-struct-info {
+    font-size: .75rem;
+    color: var(--text2);
+    margin-bottom: 6px;
+  }
+  .table-struct-btns {
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+  }
+  .table-struct-btns .btn {
+    font-size: .76rem;
+    padding: 4px 9px;
+  }
 </style>
 </head>
 <body>
@@ -447,7 +494,20 @@
     <option value="google">Google Vision OCR</option>
     <option value="rapidocr">Docling OCR (RapidOCR)</option>
   </select>
+  <button class="btn btn-secondary" onclick="showImportFolderPanel()" title="Import images + COCO table labels from a local folder">📁 Import Folder</button>
   <span id="status-bar">No file loaded</span>
+</div>
+
+<!-- ── Import folder panel ───────────────────────────────────────── -->
+<div id="import-folder-panel" style="display:none">
+  <span style="font-size:.82rem;white-space:nowrap">Folder path:</span>
+  <input type="text" id="import-folder-path" placeholder="e.g. 60  or  /abs/path/to/folder" />
+  <label style="font-size:.82rem;white-space:nowrap;display:flex;align-items:center;gap:4px;cursor:pointer" title="Also run Docling on each image to detect text, titles and other non-table elements">
+    <input type="checkbox" id="import-folder-docling" />
+    Detect other elements (Docling)
+  </label>
+  <button class="btn btn-primary" onclick="importFolder()">Load</button>
+  <button class="btn btn-secondary" onclick="document.getElementById('import-folder-panel').style.display='none'">✕</button>
 </div>
 
 <!-- ── Main ───────────────────────────────────────────────────── -->
@@ -529,6 +589,19 @@
           <button class="btn btn-secondary" id="btn-ocr-region" onclick="ocrRegion()" title="Run Google OCR on the selected element's region">🔍 OCR Region</button>
         </div>
 
+        <!-- Table structure editor (visible for table elements only) -->
+        <div id="table-struct-section" style="display:none">
+          <div class="table-struct-header">Table Structure</div>
+          <div id="table-struct-info"></div>
+          <div class="table-struct-btns">
+            <button class="btn btn-secondary" onclick="addTableRow()">+ Row</button>
+            <button class="btn btn-secondary" onclick="removeTableRow()">− Row</button>
+            <button class="btn btn-secondary" onclick="addTableCol()">+ Col</button>
+            <button class="btn btn-secondary" onclick="removeTableCol()">− Col</button>
+            <button class="btn btn-warning" onclick="ocrAllCells()" title="Run Google OCR on every cell">🔍 OCR All Cells</button>
+          </div>
+        </div>
+
         <!-- Table reconstruction (visible for table elements only, below OCR Region button) -->
         <div id="table-preview">
           <div id="table-preview-header" onclick="toggleTablePreview()">
@@ -592,6 +665,7 @@ let state = {
   drawStart: null,
   resizing: false,
   resizeCorner: null, // 'nw'|'ne'|'sw'|'se'
+  draggingTableLine: null, // { type: 'row'|'col', index: int }
   imgNaturalW: 0,
   imgNaturalH: 0,
   pageDims: {},
@@ -819,6 +893,34 @@ function drawTableGrid(el, x, y, w, h, color) {
     return;
   }
 
+  // Use explicit row/col separator positions when available (COCO import or user-adjusted)
+  if ((el.table_rows && el.table_rows.length) || (el.table_cols && el.table_cols.length)) {
+    ctx.save();
+    ctx.setLineDash([]);
+    (el.table_rows || []).forEach((ry, i) => {
+      const cy_c = ry * canvas.height;
+      const isActive = state.draggingTableLine &&
+                       state.draggingTableLine.type === 'row' &&
+                       state.draggingTableLine.index === i &&
+                       state.selectedId === el.id;
+      ctx.strokeStyle = isActive ? 'rgba(255,200,0,1)' : 'rgba(255,255,255,0.75)';
+      ctx.lineWidth = isActive ? 2.5 : 1.5;
+      ctx.beginPath(); ctx.moveTo(x, cy_c); ctx.lineTo(x + w, cy_c); ctx.stroke();
+    });
+    (el.table_cols || []).forEach((rx, i) => {
+      const cx_c = rx * canvas.width;
+      const isActive = state.draggingTableLine &&
+                       state.draggingTableLine.type === 'col' &&
+                       state.draggingTableLine.index === i &&
+                       state.selectedId === el.id;
+      ctx.strokeStyle = isActive ? 'rgba(255,200,0,1)' : 'rgba(255,255,255,0.75)';
+      ctx.lineWidth = isActive ? 2.5 : 1.5;
+      ctx.beginPath(); ctx.moveTo(cx_c, y); ctx.lineTo(cx_c, y + h); ctx.stroke();
+    });
+    ctx.restore();
+    return;
+  }
+
   // Fallback: draw an equally-spaced grid based on row/col counts from table_html
   if (!el.table_html) return;
   const tmp = document.createElement('div');
@@ -858,6 +960,7 @@ function canvasToNorm(cx, cy) {
 
 // ─── Resize helpers ───────────────────────────────────────────────────────────
 const RESIZE_HIT_PX = 8;
+const TABLE_LINE_HIT_PX = 6;
 const CORNER_CURSORS = { nw: 'nw-resize', ne: 'ne-resize', sw: 'sw-resize', se: 'se-resize' };
 
 function getResizeCorner(el, cx, cy) {
@@ -871,6 +974,25 @@ function getResizeCorner(el, cx, cy) {
   ];
   for (const c of corners) {
     if (Math.abs(cx - c.px) <= RESIZE_HIT_PX && Math.abs(cy - c.py) <= RESIZE_HIT_PX) return c.name;
+  }
+  return null;
+}
+
+// Returns { type: 'row'|'col', index } if (cx,cy) is near a table separator line of the selected element
+function getTableLineHit(cx, cy) {
+  if (!state.selectedId) return null;
+  const el = getCurrentPageElement(state.selectedId);
+  if (!el || el.label !== 'table') return null;
+  const { x: tx, y: ty, w: tw, h: th } = normToCanvas(el.bbox_norm);
+  for (let i = 0; i < (el.table_rows || []).length; i++) {
+    const ry = el.table_rows[i] * canvas.height;
+    if (Math.abs(cy - ry) <= TABLE_LINE_HIT_PX && cx >= tx - 2 && cx <= tx + tw + 2)
+      return { type: 'row', index: i };
+  }
+  for (let i = 0; i < (el.table_cols || []).length; i++) {
+    const rx = el.table_cols[i] * canvas.width;
+    if (Math.abs(cx - rx) <= TABLE_LINE_HIT_PX && cy >= ty - 2 && cy <= ty + th + 2)
+      return { type: 'col', index: i };
   }
   return null;
 }
@@ -892,7 +1014,15 @@ canvas.addEventListener('mousedown', e => {
   const { x: nx, y: ny } = canvasToNorm(cx, cy);
 
   if (state.mode === 'select') {
-    // Check for corner resize handle on the currently selected element first
+    // 1. Check for table separator line drag (highest priority when a table is selected)
+    const tableLineHit = getTableLineHit(cx, cy);
+    if (tableLineHit) {
+      state.draggingTableLine = tableLineHit;
+      canvas.style.cursor = tableLineHit.type === 'row' ? 'row-resize' : 'col-resize';
+      e.preventDefault();
+      return;
+    }
+    // 2. Check for corner resize handle on the currently selected element
     if (state.selectedId) {
       const selEl = getCurrentPageElement(state.selectedId);
       const corner = getResizeCorner(selEl, cx, cy);
@@ -920,6 +1050,29 @@ canvas.addEventListener('mousemove', e => {
   const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
   const { x: nx, y: ny } = canvasToNorm(cx, cy);
 
+  // ── Table separator line drag ────────────────────────────────────────────────
+  if (state.draggingTableLine) {
+    const el = getCurrentPageElement(state.selectedId);
+    if (el) {
+      const bbox = el.bbox_norm;
+      if (state.draggingTableLine.type === 'row') {
+        const rows = [...(el.table_rows || [])];
+        rows[state.draggingTableLine.index] = Math.round(
+          Math.max(bbox.y1, Math.min(bbox.y2, ny)) * 10000
+        ) / 10000;
+        el.table_rows = rows;
+      } else {
+        const cols = [...(el.table_cols || [])];
+        cols[state.draggingTableLine.index] = Math.round(
+          Math.max(bbox.x1, Math.min(bbox.x2, nx)) * 10000
+        ) / 10000;
+        el.table_cols = cols;
+      }
+      renderCanvas();
+    }
+    return;
+  }
+
   // ── Resize in progress ──────────────────────────────────────────────────────
   if (state.resizing) {
     const el = getCurrentPageElement(state.selectedId);
@@ -946,10 +1099,17 @@ canvas.addEventListener('mousemove', e => {
   }
 
   // ── Cursor update in select mode ─────────────────────────────────────────────
-  if (state.mode === 'select' && state.selectedId) {
-    const selEl = getCurrentPageElement(state.selectedId);
-    const corner = getResizeCorner(selEl, cx, cy);
-    canvas.style.cursor = corner ? CORNER_CURSORS[corner] : 'default';
+  if (state.mode === 'select') {
+    const tableLineHit = getTableLineHit(cx, cy);
+    if (tableLineHit) {
+      canvas.style.cursor = tableLineHit.type === 'row' ? 'row-resize' : 'col-resize';
+    } else if (state.selectedId) {
+      const selEl = getCurrentPageElement(state.selectedId);
+      const corner = getResizeCorner(selEl, cx, cy);
+      canvas.style.cursor = corner ? CORNER_CURSORS[corner] : 'default';
+    } else {
+      canvas.style.cursor = 'default';
+    }
   }
 
   if (!state.drawing) return;
@@ -969,6 +1129,21 @@ canvas.addEventListener('mousemove', e => {
 });
 
 canvas.addEventListener('mouseup', e => {
+  // ── Commit table line drag ────────────────────────────────────────────────────
+  if (state.draggingTableLine) {
+    const el = getCurrentPageElement(state.selectedId);
+    if (el) {
+      syncTableHtml(el);
+      renderTablePreview(el);
+      updateTableStructInfo(el);
+      buildElementsList();
+    }
+    state.draggingTableLine = null;
+    canvas.style.cursor = 'default';
+    renderCanvas();
+    return;
+  }
+
   // ── Commit resize ────────────────────────────────────────────────────────────
   if (state.resizing) {
     state.resizing = false;
@@ -1015,6 +1190,13 @@ canvas.addEventListener('mouseup', e => {
 });
 
 canvas.addEventListener('mouseleave', () => {
+  if (state.draggingTableLine) {
+    const el = getCurrentPageElement(state.selectedId);
+    if (el) { syncTableHtml(el); renderTablePreview(el); }
+    state.draggingTableLine = null;
+    canvas.style.cursor = 'default';
+    renderCanvas();
+  }
   if (state.resizing) {
     state.resizing = false;
     state.resizeCorner = null;
@@ -1064,6 +1246,7 @@ function updateEditPanel(el) {
   if (!el) {
     noSel.style.display = ''; form.style.display = 'none';
     document.getElementById('table-preview').style.display = 'none';
+    document.getElementById('table-struct-section').style.display = 'none';
     return;
   }
   noSel.style.display = 'none'; form.style.display = '';
@@ -1087,6 +1270,9 @@ function updateEditPanel(el) {
   document.getElementById('bbox-y1').value = b.y1 ?? 0;
   document.getElementById('bbox-x2').value = b.x2 ?? 1;
   document.getElementById('bbox-y2').value = b.y2 ?? 1;
+
+  // Table structure section (only for table elements)
+  updateTableStructInfo(el);
 
   // Table preview
   renderTablePreview(el);
@@ -1545,11 +1731,219 @@ async function ocrRegion() {
     if (data.error) { toast('OCR failed: ' + data.error, 'error'); return; }
     const text = data.text || '';
     if (!text) { toast('No text recognised in this region.', 'warning'); return; }
+    // Update element state so the text is preserved on export
+    el.content = text;
     document.getElementById('edit-content').value = text;
+    buildElementsList();
     toast('OCR complete – text inserted into content field.', 'success');
   } catch(e) {
     hideSpinner();
     toast('OCR error: ' + e.message, 'error');
+  }
+}
+
+// ─── Table structure editor ───────────────────────────────────────────────────
+
+function updateTableStructInfo(el) {
+  const section = document.getElementById('table-struct-section');
+  const info    = document.getElementById('table-struct-info');
+  if (!el || el.label !== 'table') { section.style.display = 'none'; return; }
+  section.style.display = '';
+  const nRows = (el.table_rows || []).length + 1;
+  const nCols = (el.table_cols || []).length + 1;
+  info.textContent = `${nRows} row${nRows !== 1 ? 's' : ''} × ${nCols} col${nCols !== 1 ? 's' : ''}  ·  Drag lines on canvas to adjust`;
+}
+
+// Rebuild table_html from current table_rows / table_cols, preserving existing cell text
+function syncTableHtml(el) {
+  if (!el || el.label !== 'table') return;
+  const nRows = (el.table_rows || []).length + 1;
+  const nCols = (el.table_cols || []).length + 1;
+
+  // Read existing cell content and header tags
+  const existingGrid = {};
+  if (el.table_html) {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = el.table_html;
+    tmp.querySelectorAll('tr').forEach((tr, ri) => {
+      let ci = 0;
+      tr.querySelectorAll('td, th').forEach(cell => {
+        existingGrid[`${ri},${ci}`] = { tag: cell.tagName.toLowerCase(), text: cell.textContent };
+        ci++;
+      });
+    });
+  }
+
+  let html = '<table>';
+  for (let ri = 0; ri < nRows; ri++) {
+    html += '<tr>';
+    for (let ci = 0; ci < nCols; ci++) {
+      const key = `${ri},${ci}`;
+      const existing = existingGrid[key];
+      const tag  = existing ? existing.tag : 'td';
+      const text = existing ? escHtml(existing.text) : '';
+      html += `<${tag}>${text}</${tag}>`;
+    }
+    html += '</tr>';
+  }
+  html += '</table>';
+  el.table_html = html;
+}
+
+function addTableRow() {
+  if (!state.selectedId) return;
+  const el = getCurrentPageElement(state.selectedId);
+  if (!el || el.label !== 'table') return;
+  const bbox = el.bbox_norm;
+  const rows = el.table_rows || [];
+  const lastY = rows.length ? rows[rows.length - 1] : bbox.y1;
+  const newY  = Math.round((lastY + bbox.y2) / 2 * 10000) / 10000;
+  el.table_rows = [...rows, Math.max(bbox.y1, Math.min(bbox.y2, newY))];
+  syncTableHtml(el);
+  renderCanvas();
+  updateTableStructInfo(el);
+  renderTablePreview(el);
+  toast('Row added', 'success');
+}
+
+function removeTableRow() {
+  if (!state.selectedId) return;
+  const el = getCurrentPageElement(state.selectedId);
+  if (!el || el.label !== 'table') return;
+  const rows = el.table_rows || [];
+  if (!rows.length) { toast('No row separators to remove.', ''); return; }
+  el.table_rows = rows.slice(0, -1);
+  syncTableHtml(el);
+  renderCanvas();
+  updateTableStructInfo(el);
+  renderTablePreview(el);
+  toast('Row removed', 'success');
+}
+
+function addTableCol() {
+  if (!state.selectedId) return;
+  const el = getCurrentPageElement(state.selectedId);
+  if (!el || el.label !== 'table') return;
+  const bbox = el.bbox_norm;
+  const cols = el.table_cols || [];
+  const lastX = cols.length ? cols[cols.length - 1] : bbox.x1;
+  const newX  = Math.round((lastX + bbox.x2) / 2 * 10000) / 10000;
+  el.table_cols = [...cols, Math.max(bbox.x1, Math.min(bbox.x2, newX))];
+  syncTableHtml(el);
+  renderCanvas();
+  updateTableStructInfo(el);
+  renderTablePreview(el);
+  toast('Column added', 'success');
+}
+
+function removeTableCol() {
+  if (!state.selectedId) return;
+  const el = getCurrentPageElement(state.selectedId);
+  if (!el || el.label !== 'table') return;
+  const cols = el.table_cols || [];
+  if (!cols.length) { toast('No column separators to remove.', ''); return; }
+  el.table_cols = cols.slice(0, -1);
+  syncTableHtml(el);
+  renderCanvas();
+  updateTableStructInfo(el);
+  renderTablePreview(el);
+  toast('Column removed', 'success');
+}
+
+// ─── OCR all cells ────────────────────────────────────────────────────────────
+async function ocrAllCells() {
+  if (!state.selectedId) { toast('Select a table element first.', 'error'); return; }
+  const el = getCurrentPageElement(state.selectedId);
+  if (!el || el.label !== 'table') { toast('Selected element is not a table.', 'error'); return; }
+  if (!(el.table_rows || el.table_cols)) {
+    toast('Table has no row/column separators. Add rows and columns first.', 'error');
+    return;
+  }
+
+  const imgUrl = state.pageImages[state.currentPage] || '';
+  const imgFilename = imgUrl.replace(/^.*\//, '');
+  if (!imgFilename) { toast('Page image not available.', 'error'); return; }
+
+  showSpinner('Running OCR on all cells…');
+  try {
+    const resp = await fetch('/ocr_table_cells', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        image_filename: imgFilename,
+        bbox_norm: el.bbox_norm,
+        table_rows: el.table_rows || [],
+        table_cols: el.table_cols || [],
+        table_html: el.table_html || '',
+      }),
+    });
+    const data = await resp.json();
+    hideSpinner();
+    if (data.error) { toast('OCR failed: ' + data.error, 'error'); return; }
+    el.table_html = data.table_html;
+    renderTablePreview(el);
+    toast('✔ OCR complete – table cells updated.', 'success');
+  } catch(e) {
+    hideSpinner();
+    toast('OCR error: ' + e.message, 'error');
+  }
+}
+
+// ─── Import image folder ──────────────────────────────────────────────────────
+function showImportFolderPanel() {
+  const panel = document.getElementById('import-folder-panel');
+  panel.style.display = panel.style.display === 'none' ? 'flex' : 'none';
+}
+
+async function importFolder() {
+  const folderPath = document.getElementById('import-folder-path').value.trim();
+  if (!folderPath) { toast('Please enter a folder path.', 'error'); return; }
+
+  const runDocling = document.getElementById('import-folder-docling').checked;
+
+  document.getElementById('import-folder-panel').style.display = 'none';
+  showSpinner(runDocling ? 'Importing folder + running Docling…' : 'Importing folder…');
+  try {
+    const resp = await fetch('/import_folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder_path: folderPath, run_docling: runDocling }),
+    });
+    const data = await resp.json();
+    hideSpinner();
+    if (data.error) { toast(data.error, 'error'); setStatus(data.error, 'error'); return; }
+    if (data.docling_warning) toast('⚠ ' + data.docling_warning, '');
+
+    // Populate state (same as processPDF)
+    state.filename    = data.filename;
+    state.pdfFilename = data.pdf_filename || '';
+    state.totalPages  = data.num_pages;
+    state.pages       = {};
+    state.removedPages = new Set();
+    data.pages.forEach(p => { state.pages[p.page_num] = p.elements || []; });
+    state.pageImages = {};
+    data.pages.forEach(p => { state.pageImages[p.page_num] = p.image_url; });
+    state.pageDims = {};
+    data.pages.forEach(p => { state.pageDims[p.page_num] = { width: p.width, height: p.height }; });
+
+    document.getElementById('btn-prev').disabled        = false;
+    document.getElementById('btn-next').disabled        = false;
+    document.getElementById('btn-remove-page').disabled = false;
+    document.getElementById('btn-redetect').disabled    = false;
+    emptyState.style.display = 'none';
+
+    const total = Object.values(state.pages).reduce((s, a) => s + a.length, 0);
+    setStatus(
+      `Imported: ${data.filename} (${data.num_pages} image${data.num_pages > 1 ? 's' : ''}, ` +
+      `${total} element${total !== 1 ? 's' : ''})`, 'ok'
+    );
+    loadPage(1);
+    buildLegend();
+    updateStats();
+  } catch(e) {
+    hideSpinner();
+    toast('Error: ' + e.message, 'error');
+    setStatus('Error: ' + e.message, 'error');
   }
 }
 

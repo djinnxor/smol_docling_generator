@@ -2,3 +2,9 @@ flask>=3.0
 pillow>=10.0
 pdf2image>=1.17
 docling>=2.0
+
+# Training dependencies
+torch>=2.0
+transformers>=4.40
+accelerate>=0.26
+peft>=0.10
