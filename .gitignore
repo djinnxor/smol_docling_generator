@@ -28,3 +28,5 @@ test pdfs/
 doctag_model_1/   
 doctag_model_notable/   
 doctag_render/
+mongolian_renders/
+mongolian_data*.jsonl

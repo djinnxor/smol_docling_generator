@@ -8,3 +8,10 @@ torch>=2.0
 transformers>=4.40
 accelerate>=0.26
 peft>=0.10
+
+# Mongolian synthetic data generation
+datasets>=2.14
+huggingface-hub>=0.20
+pyarrow>=14.0.1
+deep-translator>=1.11
+argostranslate>=1.9
