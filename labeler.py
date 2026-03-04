@@ -840,6 +840,85 @@ def redetect_tables():
 # COCO-table helper
 # ---------------------------------------------------------------------------
 
+
+def process_image_with_docling(img_path):
+    """Run docling on a single image file and return non-table elements
+    with normalised (0–1) bounding boxes.
+
+    This is used by /import_folder when ``run_docling=True`` so that text,
+    titles, headers and other non-table elements are included alongside the
+    COCO-derived table elements.
+
+    Returns a list of element dicts (same schema as /process elements), or
+    an empty list when docling is not installed or processing fails.
+    """
+    try:
+        from docling.document_converter import DocumentConverter
+        from docling.datamodel.base_models import InputFormat
+    except ImportError:
+        return []
+
+    try:
+        converter = DocumentConverter(allowed_formats=[InputFormat.IMAGE])
+        result = converter.convert(img_path)
+        doc = result.document
+    except Exception:
+        return []
+
+    # Determine page dimensions (pixels) — docling uses TOPLEFT origin for images
+    page_w, page_h = 0.0, 0.0
+    try:
+        pages_attr = doc.pages
+        if hasattr(pages_attr, "items"):
+            page_items = list(pages_attr.items())
+        elif hasattr(pages_attr, "__iter__"):
+            page_items = list(enumerate(pages_attr, 1))
+        else:
+            page_items = []
+        if page_items:
+            _, first_page = page_items[0]
+            if hasattr(first_page, "size") and first_page.size:
+                page_w = float(getattr(first_page.size, "width", 0))
+                page_h = float(getattr(first_page.size, "height", 0))
+    except Exception:
+        pass
+
+    # Fall back to actual pixel dimensions from the image file
+    if not page_w or not page_h:
+        try:
+            with Image.open(img_path) as pil_img:
+                page_w, page_h = float(pil_img.width), float(pil_img.height)
+        except Exception:
+            return []
+
+    elements = []
+    try:
+        for item, _level in doc.iterate_items():
+            label = item.label.value if hasattr(item.label, "value") else str(item.label)
+            # Skip table elements – they are supplied by the COCO labels
+            if label == "table":
+                continue
+            if not hasattr(item, "prov") or not item.prov:
+                continue
+            prov_list = item.prov if isinstance(item.prov, list) else [item.prov]
+            for prov in prov_list:
+                raw_bbox = getattr(prov, "bbox", None)
+                if raw_bbox is None:
+                    continue
+                bbox_norm = _bbox_to_norm(raw_bbox, page_w, page_h)
+                if bbox_norm is None:
+                    continue
+                elements.append({
+                    "id": str(uuid.uuid4()),
+                    "label": label,
+                    "content": _get_item_text(item),
+                    "bbox_norm": bbox_norm,
+                })
+    except Exception:
+        pass
+
+    return elements
+
 def _coco_to_table_element(annotations):
     """Convert a list of (class_id, cx, cy, w, h) COCO table-structure annotations
     to a labeler element dict containing ``table_html``, ``table_rows``, and
@@ -945,7 +1024,16 @@ def import_folder():
     """Import all images from a local folder, matching each to a COCO-format
     .txt label file (same stem) to build table elements.
 
-    Accepts JSON: ``{ "folder_path": "/abs/or/relative/path" }``
+    Accepts JSON::
+
+        {
+            "folder_path": "/abs/or/relative/path",
+            "run_docling": false   # optional: also detect non-table elements
+        }
+
+    When ``run_docling`` is ``true``, docling is run on every image to detect
+    text, titles, headers and other non-table elements, which are merged
+    alongside the COCO-derived table elements.
 
     Returns the same JSON structure as ``/process``.
     """
@@ -956,6 +1044,8 @@ def import_folder():
     folder_path = data.get("folder_path", "").strip()
     if not folder_path:
         return jsonify({"error": "folder_path is required"}), 400
+
+    run_docling = bool(data.get("run_docling", False))
 
     # Resolve relative to BASE_DIR
     folder = (
@@ -973,6 +1063,7 @@ def import_folder():
         return jsonify({"error": "No image files found in folder"}), 400
 
     pages = []
+    docling_warning = None
     for page_no, img_file in enumerate(img_files, 1):
         dest_name = secure_filename(img_file.name)
         dest_path = os.path.join(UPLOAD_FOLDER, dest_name)
@@ -986,9 +1077,18 @@ def import_folder():
         except Exception:
             img_w, img_h = 0, 0
 
-        # Parse optional COCO label file
-        txt_file = folder / (img_file.stem + ".txt")
+        # Non-table elements from docling (optional)
         elements = []
+        if run_docling:
+            try:
+                docling_elements = process_image_with_docling(dest_path)
+                elements.extend(docling_elements)
+            except Exception as exc:
+                if docling_warning is None:
+                    docling_warning = f"Docling processing failed: {exc}"
+
+        # Parse optional COCO label file and append table element(s)
+        txt_file = folder / (img_file.stem + ".txt")
         if txt_file.exists():
             annotations = []
             with open(txt_file, encoding="utf-8") as fh:
@@ -1018,12 +1118,15 @@ def import_folder():
             "elements": elements,
         })
 
-    return jsonify({
+    resp = {
         "filename": folder.name,
         "pdf_filename": "",
         "num_pages": len(pages),
         "pages": pages,
-    })
+    }
+    if docling_warning:
+        resp["docling_warning"] = docling_warning
+    return jsonify(resp)
 
 
 # ---------------------------------------------------------------------------
