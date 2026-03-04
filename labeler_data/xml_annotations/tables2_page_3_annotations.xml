@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<page num="3" image="tables2_page_3" width="1650" height="1275">
+  <section_header bbox_x1="0.0707" bbox_y1="0.0986" bbox_x2="0.775" bbox_y2="0.128">Хүснэгт 1: Улсын төсвийн орлого, зарлага (тэрбум төгрөг)</section_header>
+  <table bbox_x1="0.2466" bbox_y1="0.1711" bbox_x2="0.7526" bbox_y2="0.379">
+    <table>
+      <tr>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+      </tr>
+      <tr>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+      </tr>
+      <tr>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+      </tr>
+      <tr>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+      </tr>
+      <tr>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+      </tr>
+      <tr>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+      </tr>
+      <tr>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+        <td/>
+      </tr>
+    </table>
+  </table>
+  <section_header bbox_x1="0.0707" bbox_y1="0.4443" bbox_x2="0.6058" bbox_y2="0.4737">Хүснэгт 2: Хүн амын статистик (мянган хүн)</section_header>
+  <table bbox_x1="0.2625" bbox_y1="0.5165" bbox_x2="0.7372" bbox_y2="0.6662">
+    <table>
+      <tr>
+        <th>Бүс нутаг</th>
+        <th colspan="2">Нийт хүн ам</th>
+        <th colspan="2">Хот</th>
+        <th colspan="2">Хөдөө</th>
+      </tr>
+      <tr>
+        <td/>
+        <th>Эрэгтэй</th>
+        <th>Эмэгтэй</th>
+        <th>Эрэгтэй</th>
+        <th>Эмэгтэй</th>
+        <th>Эрэгтэй</th>
+        <th>Эмэгтэй</th>
+      </tr>
+      <tr>
+        <th>Улаанбаатар</th>
+        <td>720</td>
+        <td>780</td>
+        <td>700</td>
+        <td>760</td>
+        <td>20</td>
+        <td>20</td>
+      </tr>
+      <tr>
+        <th>Төв бүс</th>
+        <td>300</td>
+        <td>320</td>
+        <td>150</td>
+        <td>160</td>
+        <td>150</td>
+        <td>160</td>
+      </tr>
+      <tr>
+        <th>Баруун бүс</th>
+        <td>250</td>
+        <td>270</td>
+        <td>100</td>
+        <td>110</td>
+        <td>150</td>
+        <td>160</td>
+      </tr>
+    </table>
+  </table>
+</page>

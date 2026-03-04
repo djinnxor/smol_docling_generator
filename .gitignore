@@ -15,6 +15,16 @@ build/
 # macOS
 .DS_Store
 
+# Docker / environment secrets
+.env
+
 smold/
 venv/
 output_version2/
+test/
+test_outputs/
+doctag_model/   
+test pdfs/
+doctag_model_1/   
+doctag_model_notable/   
+doctag_render/
