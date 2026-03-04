@@ -30,7 +30,7 @@ If you want to use **Google OCR** inside the labeler, create a file called `.env
 
 ```bash
 # .env  (never commit this file)
-GOOGLE_API_KEY=AIzaSy...your-key-here...
+GOOGLE_API_KEY=...your-key-here...
 ```
 
 Skip this step if you only need Docling's built-in text extraction or RapidOCR.
