@@ -146,7 +146,15 @@ def xml_to_doctag_pairs(xml_path: str, images_dir: str):
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
-    for page in root.findall("page"):
+    # Support two XML layouts produced by export_xml:
+    #   1. <page> as root (one file per page – the common labeler output)
+    #   2. <document> as root wrapping one or more <page> children (legacy)
+    if root.tag == "page":
+        pages = [root]
+    else:
+        pages = root.findall("page")
+
+    for page in pages:
         page_num = page.get("num", "1")
         image_stem = page.get("image", "")
 
