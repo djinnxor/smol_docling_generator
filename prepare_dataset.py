@@ -72,44 +72,6 @@ def _element_to_doctag(tag: str, lx1: int, ly1: int, lx2: int, ly2: int, content
         return f"<{tag}>{loc}</{tag}>"
     return f"<{tag}>{loc}{content}</{tag}>"
 
-def table_xml_to_doctag(table_elem, scale=500):
-    """
-    Convert an XML <table> element to DocTag format.
-    Preserves all rows, columns, and cells (including empty).
-    """
-    # Get table bbox
-    bbox_x1 = float(table_elem.attrib.get("bbox_x1", 0))
-    bbox_y1 = float(table_elem.attrib.get("bbox_y1", 0))
-    bbox_x2 = float(table_elem.attrib.get("bbox_x2", 1))
-    bbox_y2 = float(table_elem.attrib.get("bbox_y2", 1))
-
-    # Scale bbox to DocTag loc tokens
-    def loc(val): return int(round(val * scale))
-    loc_str = (
-        f"<loc_{loc(bbox_x1)}><loc_{loc(bbox_y1)}>"
-        f"<loc_{loc(bbox_x2)}><loc_{loc(bbox_y2)}>"
-    )
-
-    # Parse table rows/cells
-    rows = []
-    # Find the nested <table> inside the outer <table>
-    inner_table = table_elem.find("table")
-    if inner_table is None:
-        inner_table = table_elem  # fallback: treat as flat table
-
-    for tr in inner_table.findall("tr"):
-        row_cells = []
-        for cell in tr:
-            tag = cell.tag  # td or th
-            text = (cell.text or "").strip()
-            row_cells.append(f"<{tag}>{text}</{tag}>")
-        rows.append("<row>" + "".join(row_cells) + "</row>")
-
-    table_content = "".join(rows)
-
-    # Compose DocTag
-    doctag = f"<otsl>{loc_str}{table_content}</otsl>"
-    return doctag
 
 def table_xml_to_doctag_from_str(table_str, scale=500):
     """Parse table XML string and convert to DocTag."""
@@ -307,7 +269,6 @@ def _coco_cx_to_corners(
     """Convert COCO center-format bbox to (x1, y1, x2, y2) corner format."""
     return cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
 
-
 def _overlaps_1d(
     a1: float, a2: float, b1: float, b2: float, threshold: float = 0.3
 ) -> bool:
@@ -316,7 +277,6 @@ def _overlaps_1d(
     inter = max(0.0, min(a2, b2) - max(a1, b1))
     shorter = min(a2 - a1, b2 - b1)
     return shorter > 0 and inter / shorter >= threshold
-
 
 def _coco_annotations_to_otsl(
     annotations: list[tuple[int, float, float, float, float]],
