@@ -1,7 +1,7 @@
 # Labeler runtime data (uploads and saved annotations)
-#labeler_data/uploads/
+labeler_data/uploads/
 labeler_data/annotations/
-#labeler_data/xml_annotations/
+labeler_data/xml_annotations/
 
 # Python
 __pycache__/
@@ -24,3 +24,4 @@ doctag_model/
 test pdfs/
 doctag_model_1/   
 doctag_model_notable/   
+doctag_render/
