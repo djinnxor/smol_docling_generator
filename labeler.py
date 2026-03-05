@@ -14,6 +14,7 @@ Options:
 import json
 import os
 import re
+import shutil
 import uuid
 import argparse
 import xml.etree.ElementTree as ET
@@ -1038,6 +1039,267 @@ def ocr_table_cells():
 
     except Exception as e:
         return jsonify({"error": f"OCR table cells failed: {e}"}), 500
+
+
+# ---------------------------------------------------------------------------
+# Import image folder
+# ---------------------------------------------------------------------------
+
+_YOLO_ROW_CLASSES = {"table row"}
+_YOLO_COL_CLASSES = {"table column"}
+_IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}
+
+
+def _parse_yolo_annotations(label_file: Path, class_names: list) -> list:
+    """Parse a YOLO-format label file and return a list of element dicts.
+
+    Each line: ``class_id  cx  cy  w  h``  (all values normalised 0-1).
+
+    For table-structure datasets (rows, columns, spanning cells, headers) the
+    function groups all annotations on the page into a single ``"table"``
+    element whose bounding box is the union of all annotations.  Row separator
+    positions (normalised within the table box) are stored in ``table_rows``
+    and column separator positions in ``table_cols`` so the labeler can render
+    the grid immediately.
+    """
+    try:
+        lines = label_file.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+    except Exception:
+        return []
+
+    rows_bboxes: list[tuple] = []
+    cols_bboxes: list[tuple] = []
+    all_bboxes: list[tuple] = []
+
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) < 5:
+            continue
+        try:
+            cls_id = int(parts[0])
+            cx, cy, bw, bh = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+        except ValueError:
+            continue
+
+        x1 = max(0.0, cx - bw / 2)
+        y1 = max(0.0, cy - bh / 2)
+        x2 = min(1.0, cx + bw / 2)
+        y2 = min(1.0, cy + bh / 2)
+
+        cls_name = class_names[cls_id] if cls_id < len(class_names) else ""
+        all_bboxes.append((x1, y1, x2, y2))
+
+        if cls_name in _YOLO_ROW_CLASSES:
+            rows_bboxes.append((x1, y1, x2, y2))
+        elif cls_name in _YOLO_COL_CLASSES:
+            cols_bboxes.append((x1, y1, x2, y2))
+
+    if not all_bboxes:
+        return []
+
+    # Union bounding box for the whole table (values already clamped during parsing)
+    tbl_x1 = min(b[0] for b in all_bboxes)
+    tbl_y1 = min(b[1] for b in all_bboxes)
+    tbl_x2 = max(b[2] for b in all_bboxes)
+    tbl_y2 = max(b[3] for b in all_bboxes)
+    tbl_w = max(1e-6, tbl_x2 - tbl_x1)
+    tbl_h = max(1e-6, tbl_y2 - tbl_y1)
+
+    # Row dividers: bottom edge of each row (except the last), normalised within table
+    seen_rows: set[float] = set()
+    table_rows: list[float] = []
+    if rows_bboxes:
+        rows_bboxes.sort(key=lambda b: b[1])
+        for rx1, ry1, rx2, ry2 in rows_bboxes[:-1]:
+            div_y = round(max(0.0, min(1.0, (ry2 - tbl_y1) / tbl_h)), 4)
+            if div_y not in seen_rows:
+                seen_rows.add(div_y)
+                table_rows.append(div_y)
+
+    # Column dividers: right edge of each column (except the last), normalised within table
+    seen_cols: set[float] = set()
+    table_cols: list[float] = []
+    if cols_bboxes:
+        cols_bboxes.sort(key=lambda b: b[0])
+        for cx1, cy1, cx2, cy2 in cols_bboxes[:-1]:
+            div_x = round(max(0.0, min(1.0, (cx2 - tbl_x1) / tbl_w)), 4)
+            if div_x not in seen_cols:
+                seen_cols.add(div_x)
+                table_cols.append(div_x)
+
+    element: dict = {
+        "id": str(uuid.uuid4()),
+        "label": "table",
+        "content": "",
+        "bbox_norm": {
+            "x1": round(tbl_x1, 4),
+            "y1": round(tbl_y1, 4),
+            "x2": round(tbl_x2, 4),
+            "y2": round(tbl_y2, 4),
+        },
+    }
+    if table_rows:
+        element["table_rows"] = sorted(table_rows)
+    if table_cols:
+        element["table_cols"] = sorted(table_cols)
+    return [element]
+
+
+@app.route("/import_folder", methods=["POST"])
+def import_folder():
+    """
+    Import all images from a local folder into the labeler, optionally reading
+    YOLO-format table annotations from a sibling ``labels/`` subdirectory.
+
+    Accepts JSON:
+    {
+        "folder_path": str,   // absolute path or path relative to the project root
+        "run_docling": bool   // optional, default false – run Docling on each
+                              // image to detect non-table elements
+    }
+    Returns the same response format as ``/process``.
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    folder_path_raw = str(data.get("folder_path", "")).strip()
+    run_docling = bool(data.get("run_docling", False))
+
+    if not folder_path_raw:
+        return jsonify({"error": "folder_path is required"}), 400
+
+    # Resolve path (relative paths are resolved against the project root)
+    folder_path = Path(folder_path_raw)
+    if not folder_path.is_absolute():
+        folder_path = Path(BASE_DIR) / folder_path
+
+    if not folder_path.exists() or not folder_path.is_dir():
+        return jsonify({"error": f"Folder not found: {folder_path_raw}"}), 404
+
+    # Locate images (prefer images/ subdirectory, fall back to folder root)
+    img_dir = folder_path / "images"
+    if img_dir.is_dir():
+        image_files = sorted(
+            f for f in img_dir.iterdir() if f.suffix.lower() in _IMG_EXTENSIONS
+        )
+    else:
+        image_files = sorted(
+            f for f in folder_path.iterdir() if f.suffix.lower() in _IMG_EXTENSIONS
+        )
+
+    if not image_files:
+        return jsonify({"error": f"No image files found in {folder_path_raw}"}), 404
+
+    # Load YOLO class names if available
+    classes_file = folder_path / "classes.txt"
+    if classes_file.exists():
+        class_names = [
+            ln.strip()
+            for ln in classes_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            if ln.strip()
+        ]
+    else:
+        class_names = []
+
+    labels_dir = folder_path / "labels"
+
+    # Build page list; also keep a map of page_no → dest_path for the Docling pass
+    pages = []
+    elements_by_page: dict[int, list] = {}
+    dest_paths: dict[int, str] = {}
+
+    for page_no, img_file in enumerate(image_files, 1):
+        # Sanitize folder and image names to avoid path-traversal issues
+        safe_folder = re.sub(r"[^\w\-]", "_", folder_path.name)
+        safe_imgname = re.sub(r"[^\w\-.]", "_", img_file.name)
+        dest_name = f"import_{safe_folder}_{safe_imgname}"
+        dest_path = os.path.join(UPLOAD_FOLDER, dest_name)
+        shutil.copy2(str(img_file), dest_path)
+        dest_paths[page_no] = dest_path
+
+        try:
+            with Image.open(dest_path) as pil_img:
+                img_w, img_h = pil_img.size
+        except Exception:
+            img_w, img_h = 0, 0
+
+        # Read YOLO annotations if present
+        elements: list = []
+        label_file = labels_dir / (img_file.stem + ".txt") if labels_dir.is_dir() else None
+        # Also check a flat .txt alongside the image (e.g. for flat-layout folders)
+        if label_file is None or not label_file.exists():
+            flat_label = img_file.parent / (img_file.stem + ".txt")
+            if flat_label.exists():
+                label_file = flat_label
+        if label_file and label_file.exists():
+            elements = _parse_yolo_annotations(label_file, class_names)
+
+        elements_by_page[page_no] = elements
+        pages.append({
+            "page_num": page_no,
+            "image_url": f"/page_image/{dest_name}",
+            "width": img_w,
+            "height": img_h,
+            "elements": elements,
+        })
+
+    # Optionally run Docling on each image to detect non-table elements.
+    # Docling's DocumentConverter accepts images directly.
+    docling_warning = None
+    if run_docling:
+        try:
+            from docling.document_converter import DocumentConverter
+
+            converter = DocumentConverter(allowed_formats=["image"])
+            for page_no, img_file in enumerate(image_files, 1):
+                dest_path = dest_paths[page_no]
+                try:
+                    result = converter.convert(dest_path)
+                    doc = result.document
+
+                    pd = {"width": pages[page_no - 1]["width"], "height": pages[page_no - 1]["height"]}
+                    if pd["width"] == 0 or pd["height"] == 0:
+                        continue
+
+                    for item, _level in doc.iterate_items():
+                        label = item.label.value if hasattr(item.label, "value") else str(item.label)
+                        # Skip table labels – already sourced from YOLO annotations
+                        if label == "table":
+                            continue
+                        content = _get_item_text(item)
+                        if not hasattr(item, "prov") or not item.prov:
+                            continue
+                        prov_list = item.prov if isinstance(item.prov, list) else [item.prov]
+                        for prov in prov_list:
+                            raw_bbox = getattr(prov, "bbox", None)
+                            if raw_bbox is None:
+                                continue
+                            bbox_norm = _bbox_to_norm(raw_bbox, pd["width"], pd["height"])
+                            if bbox_norm is None:
+                                continue
+                            elements_by_page[page_no].append({
+                                "id": str(uuid.uuid4()),
+                                "label": label,
+                                "content": content,
+                                "bbox_norm": bbox_norm,
+                            })
+                    # Update pages list
+                    pages[page_no - 1]["elements"] = elements_by_page[page_no]
+                except Exception as img_err:
+                    docling_warning = (docling_warning or "") + f" [{img_file.name}: {img_err}]"
+        except Exception as e:
+            docling_warning = f"Docling processing failed: {e}"
+
+    resp: dict = {
+        "filename": folder_path.name,
+        "pdf_filename": "",
+        "num_pages": len(pages),
+        "pages": pages,
+    }
+    if docling_warning:
+        resp["docling_warning"] = docling_warning.strip()
+    return jsonify(resp)
 
 
 # ---------------------------------------------------------------------------
