@@ -666,19 +666,19 @@ def main() -> None:
 
     if args.split_ratio > 0:
         train_path, val_path = split_and_save(
-            translated_doctags, args.output,
+            image_paths=image_paths,
+            doctags=translated_doctags, output_path=args.output,
             split_ratio=args.split_ratio,
             source_doctags=sources,
-            image_paths=image_paths,
-        )
+            )
         print(f"\nDone! Train: {train_path}")
         if val_path:
             print(f"       Val:   {val_path}")
     else:
         written = save_jsonl(
-            translated_doctags, args.output,
-            source_doctags=sources,
             image_paths=image_paths,
+            doctags=translated_doctags, output_path=args.output,
+            source_doctags=sources,
         )
         print(f"\nDone! Saved {len(translated_doctags)} records to {written}")
 
