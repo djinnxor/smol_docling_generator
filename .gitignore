@@ -32,3 +32,4 @@ mongolian_renders/
 mongolian_data*.jsonl
 mn-pages/
 smol-docling-labeler.tar
+custom_models/
