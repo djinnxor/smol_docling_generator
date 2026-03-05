@@ -323,11 +323,36 @@ def _extract_doctags_from_texts(texts) -> list[str]:
 
 _DOCTAG_BLOCK_RE = re.compile(r"<doctag>.*?</doctag>", re.DOTALL)
 _DOCTAG_INNER_RE = re.compile(r"<doctag>(.*?)</doctag>", re.DOTALL)
+_PAGEBREAK_SPLIT_RE = re.compile(r"\s*<page_break>\s*", re.IGNORECASE)
 
 
 def _find_doctag_blocks(text: str) -> list[str]:
     """Find all <doctag>…</doctag> blocks in a string."""
     return _DOCTAG_BLOCK_RE.findall(text)
+
+
+def split_doctag_on_pagebreak(doctag: str) -> list[str]:
+    """Split a combined multi-page doctag on ``<page_break>`` tokens.
+
+    Returns a list of single-page ``<doctag>…</doctag>`` strings.  If the
+    input contains no ``<page_break>``, a one-element list with the original
+    doctag is returned unchanged.
+
+    Example::
+
+        combined = "<doctag>page1<page_break>page2</doctag>"
+        pages = split_doctag_on_pagebreak(combined)
+        # → ["<doctag>page1</doctag>", "<doctag>page2</doctag>"]
+    """
+    if "<page_break>" not in doctag.lower():
+        return [doctag]
+    m = _DOCTAG_INNER_RE.search(doctag)
+    if not m:
+        return [doctag]
+    inner = m.group(1)
+    parts = _PAGEBREAK_SPLIT_RE.split(inner)
+    result = [f"<doctag>{p.strip()}</doctag>" for p in parts if p.strip()]
+    return result if result else [doctag]
 
 
 def combine_doctag_pages(page_doctags: list[str]) -> str:
@@ -453,8 +478,12 @@ def _load_via_parquet(
                     break
                 texts = table.column("texts")[i].as_py()
                 found = _extract_doctags_from_texts(texts)
+                # Expand any combined doctag that already contains <page_break>
                 if found:
-                    doctag_groups.append(found)
+                    expanded: list[str] = []
+                    for dt in found:
+                        expanded.extend(split_doctag_on_pagebreak(dt))
+                    doctag_groups.append(expanded)
                 row_counter += 1
         except Exception as exc:
             print(f"  [warn] Failed to read shard: {exc}", file=sys.stderr)
@@ -509,8 +538,12 @@ def _load_via_streaming(
             break
         texts = row.get("texts", [])
         found = _extract_doctags_from_texts(texts)
+        # Expand any combined doctag that already contains <page_break>
         if found:
-            doctag_groups.append(found)
+            expanded: list[str] = []
+            for dt in found:
+                expanded.extend(split_doctag_on_pagebreak(dt))
+            doctag_groups.append(expanded)
 
     total = sum(len(g) for g in doctag_groups)
     print(f"  Extracted {total} DocTag strings in "

@@ -17,7 +17,4 @@ deep-translator>=1.11
 argostranslate>=1.9
 
 # Optional: offline OCR backend (alternative to Google Vision OCR in labeler.py)
-# Install one of:
-#   pip install rapidocr-onnxruntime   (recommended, CPU)
-#   pip install rapidocr-openvino      (Intel OpenVINO accelerated)
-# rapidocr-onnxruntime>=1.3
+easyocr>=1.7

@@ -16,6 +16,7 @@ from generate_mongolian_data import (
     save_jsonl,
     split_and_save,
     combine_doctag_pages,
+    split_doctag_on_pagebreak,
     batch_translate_doctag_groups,
     _build_save_entries,
 )
@@ -463,6 +464,61 @@ def test_save_jsonl_multipage_image_list():
         assert rec1["image"] == ["page_01.png", "page_02.png"]
     finally:
         os.unlink(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Feature 4: split_doctag_on_pagebreak
+# ---------------------------------------------------------------------------
+
+def test_split_doctag_on_pagebreak_single():
+    """A doctag with no <page_break> must be returned unchanged in a 1-element list."""
+    dt = "<doctag><text><loc_0><loc_0><loc_100><loc_50>Only page</text></doctag>"
+    result = split_doctag_on_pagebreak(dt)
+    assert result == [dt]
+
+
+def test_split_doctag_on_pagebreak_two_pages():
+    """A combined 2-page doctag must split into two separate single-page doctags."""
+    p1 = "<text><loc_0><loc_0><loc_100><loc_50>Page one</text>"
+    p2 = "<text><loc_0><loc_60><loc_100><loc_120>Page two</text>"
+    combined = f"<doctag>{p1}\n<page_break>\n{p2}</doctag>"
+    result = split_doctag_on_pagebreak(combined)
+    assert len(result) == 2
+    assert result[0].startswith("<doctag>") and result[0].endswith("</doctag>")
+    assert result[1].startswith("<doctag>") and result[1].endswith("</doctag>")
+    assert "Page one" in result[0]
+    assert "<page_break>" not in result[0]
+    assert "Page two" in result[1]
+    assert "<page_break>" not in result[1]
+
+
+def test_split_doctag_on_pagebreak_three_pages():
+    """A combined 3-page doctag must split into three separate doctags."""
+    parts = [
+        f"<text><loc_0><loc_0><loc_100><loc_50>P{i}</text>"
+        for i in range(1, 4)
+    ]
+    combined = "<doctag>" + "<page_break>".join(parts) + "</doctag>"
+    result = split_doctag_on_pagebreak(combined)
+    assert len(result) == 3
+    for i, page in enumerate(result, 1):
+        assert f"P{i}" in page
+        assert "<page_break>" not in page
+        assert page.count("<doctag>") == 1
+
+
+def test_split_doctag_on_pagebreak_roundtrip():
+    """combine_doctag_pages followed by split_doctag_on_pagebreak must recover originals."""
+    pages = [
+        f"<doctag><text><loc_0><loc_0><loc_100><loc_50>Page {i}</text></doctag>"
+        for i in range(1, 4)
+    ]
+    combined = combine_doctag_pages(pages)
+    recovered = split_doctag_on_pagebreak(combined)
+    assert len(recovered) == len(pages)
+    for i, (orig, rec) in enumerate(zip(pages, recovered), 1):
+        assert f"Page {i}" in rec
+        assert "<page_break>" not in rec
 
 
 if __name__ == "__main__":

@@ -492,7 +492,7 @@
   <select id="ocr-model-select" title="OCR model to use for text extraction">
     <option value="none">No OCR Override</option>
     <option value="google">Google Vision OCR</option>
-    <option value="rapidocr">Docling OCR (RapidOCR)</option>
+    <option value="easyocr">EasyOCR</option>
   </select>
   <button class="btn btn-secondary" onclick="showImportFolderPanel()" title="Import images + COCO table labels from a local folder">📁 Import Folder</button>
   <span id="status-bar">No file loaded</span>
@@ -740,6 +740,7 @@ async function processPDF() {
     if (data.error) { toast(data.error, 'error'); setStatus(data.error, 'error'); return; }
     if (data.docling_warning) toast('⚠ ' + data.docling_warning, '');
     if (data.ocr_warning) toast('⚠ ' + data.ocr_warning, '');
+    if (data.ocr_used) toast(`ℹ OCR used: ${data.ocr_used}`, 'success');
 
     // Populate state
     state.filename    = data.filename;
@@ -1676,7 +1677,7 @@ async function redetectTables() {
   if (!state.totalPages || !state.pdfFilename) { toast('Load a PDF first.', 'error'); return; }
 
   const ocrModel = document.getElementById('ocr-model-select').value;
-  const ocrLabel = ocrModel === 'rapidocr' ? 'RapidOCR' : ocrModel === 'google' ? 'Google OCR' : 'no OCR';
+  const ocrLabel = ocrModel === 'easyocr' ? 'EasyOCR' : ocrModel === 'google' ? 'Google OCR' : 'no OCR';
   showSpinner(`Re-detecting tables on page ${state.currentPage} (${ocrLabel})…`);
   try {
     const resp = await fetch('/redetect_tables', {
@@ -1703,7 +1704,8 @@ async function redetectTables() {
     renderCanvas();
     buildElementsList();
     updateStats();
-    toast(`Re-detection: ${added} new table${added !== 1 ? 's' : ''} added.`, added ? 'success' : '');
+    const usedLabel = data.ocr_used ? ` (${data.ocr_used})` : '';
+    toast(`Re-detection${usedLabel}: ${added} new table${added !== 1 ? 's' : ''} added.`, added ? 'success' : '');
   } catch(e) {
     toast('Error: ' + e.message, 'error');
   } finally {
@@ -1722,7 +1724,7 @@ async function ocrRegion() {
   if (!imgFilename) { toast('Page image not available.', 'error'); return; }
 
   const ocrModel = document.getElementById('ocr-model-select').value;
-  const ocrLabel = ocrModel === 'rapidocr' ? 'RapidOCR' : 'Google OCR';
+  const ocrLabel = ocrModel === 'easyocr' ? 'EasyOCR' : 'Google OCR';
   showSpinner(`Running ${ocrLabel} on region…`);
   try {
     const resp = await fetch('/ocr_region', {
@@ -1739,7 +1741,8 @@ async function ocrRegion() {
     el.content = text;
     document.getElementById('edit-content').value = text;
     buildElementsList();
-    toast('OCR complete – text inserted into content field.', 'success');
+    const usedLabel = data.ocr_used || ocrLabel;
+    toast(`✔ ${usedLabel} complete – text inserted into content field.`, 'success');
   } catch(e) {
     hideSpinner();
     toast('OCR error: ' + e.message, 'error');
@@ -1869,7 +1872,7 @@ async function ocrAllCells() {
   if (!imgFilename) { toast('Page image not available.', 'error'); return; }
 
   const ocrModel = document.getElementById('ocr-model-select').value;
-  const ocrLabel = ocrModel === 'rapidocr' ? 'RapidOCR' : 'Google OCR';
+  const ocrLabel = ocrModel === 'easyocr' ? 'EasyOCR' : 'Google OCR';
   showSpinner(`Running ${ocrLabel} on all cells…`);
   try {
     const resp = await fetch('/ocr_table_cells', {
@@ -1889,7 +1892,8 @@ async function ocrAllCells() {
     if (data.error) { toast('OCR failed: ' + data.error, 'error'); return; }
     el.table_html = data.table_html;
     renderTablePreview(el);
-    toast('✔ OCR complete – table cells updated.', 'success');
+    const usedLabel = data.ocr_used || ocrLabel;
+    toast(`✔ ${usedLabel} complete – table cells updated.`, 'success');
   } catch(e) {
     hideSpinner();
     toast('OCR error: ' + e.message, 'error');

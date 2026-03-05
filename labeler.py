@@ -41,6 +41,12 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(ANNOTATIONS_FOLDER, exist_ok=True)
 os.makedirs(XML_ANNOTATIONS_FOLDER, exist_ok=True)
 
+# Human-readable labels for the OCR engine used in toast/response messages
+_OCR_LABELS: dict[str, str] = {
+    "google": "Google Vision OCR",
+    "easyocr": "EasyOCR",
+}
+
 # All supported docling tag types with display colors
 DOCLING_TAGS = [
     "text",
@@ -362,13 +368,13 @@ def apply_google_ocr_to_elements(elements_by_page, image_paths):
     return elements_by_page
 
 
-def apply_rapidocr_to_elements(elements_by_page, image_paths):
+def apply_easyocr_to_elements(elements_by_page, image_paths):
     """
-    Replace each element's text content using RapidOCR (docling's built-in OCR engine).
+    Replace each element's text content using EasyOCR.
     Crops each element's bounding box from the page image and OCRs the region.
     Labels that typically contain no text (e.g. 'picture') are skipped.
     """
-    engine = _get_rapidocr_engine()
+    reader = _get_easyocr_reader()
     skip_labels = {"picture"}
 
     for page_no, img_path in enumerate(image_paths, 1):
@@ -393,8 +399,8 @@ def apply_rapidocr_to_elements(elements_by_page, image_paths):
             cropped = img.crop((x1, y1, x2, y2))
             img_array = np.array(cropped)
             try:
-                result, _ = engine(img_array)
-                text = _rapidocr_text_from_result(result)
+                result = reader.readtext(img_array)
+                text = _easyocr_text_from_result(result)
                 if text:
                     el["content"] = text
             except Exception:
@@ -407,24 +413,29 @@ def apply_rapidocr_to_elements(elements_by_page, image_paths):
 # Shared OCR helpers used by the route handlers below
 # ---------------------------------------------------------------------------
 
-def _get_rapidocr_engine():
-    """Return a RapidOCR engine instance (raises ImportError if not installed)."""
+# Module-level EasyOCR reader cache (loading the model is expensive)
+_easyocr_reader_cache = None
+
+
+def _get_easyocr_reader(langs=None):
+    """Return a cached EasyOCR Reader instance (raises ImportError if not installed)."""
+    global _easyocr_reader_cache
+    if _easyocr_reader_cache is not None:
+        return _easyocr_reader_cache
     try:
-        from rapidocr_onnxruntime import RapidOCR
+        import easyocr  # type: ignore[import-untyped]
     except ImportError:
-        try:
-            from rapidocr_openvino import RapidOCR
-        except ImportError:
-            raise ImportError(
-                "RapidOCR is not installed. Run: pip install rapidocr-onnxruntime"
-            )
-    return RapidOCR()
+        raise ImportError(
+            "EasyOCR is not installed. Run: pip install easyocr"
+        )
+    _easyocr_reader_cache = easyocr.Reader(langs or ["en"], verbose=False)
+    return _easyocr_reader_cache
 
 
-def _rapidocr_text_from_result(result) -> str:
-    """Extract a plain text string from a RapidOCR result tuple.
+def _easyocr_text_from_result(result) -> str:
+    """Extract a plain text string from an EasyOCR result list.
 
-    Each detected line is a tuple ``(bbox, text, confidence)``.  Lines are
+    Each detected region is a tuple ``(bbox, text, confidence)``.  Lines are
     joined with a space so the output matches single-line text regions.
     """
     if not result:
@@ -445,17 +456,17 @@ def _ocr_crop_pil(
     cropped_pil:
         A :class:`PIL.Image.Image` crop of the region to recognise.
     ocr_model:
-        ``"google"`` for Google Vision OCR, ``"rapidocr"`` for RapidOCR.
+        ``"google"`` for Google Vision OCR, ``"easyocr"`` for EasyOCR.
     google_ocr:
         An already-constructed :class:`GoogleOCR` instance (used when
         *ocr_model* is ``"google"``).  If *None* a new instance is created
         using the ``GOOGLE_OCR_API_KEY`` env var.
     """
-    if ocr_model == "rapidocr":
-        engine = _get_rapidocr_engine()
+    if ocr_model == "easyocr":
+        reader = _get_easyocr_reader()
         img_array = np.array(cropped_pil)
-        result, _ = engine(img_array)
-        return _rapidocr_text_from_result(result)
+        result = reader.readtext(img_array)
+        return _easyocr_text_from_result(result)
 
     # Default: Google Vision OCR
     if google_ocr is None:
@@ -519,11 +530,11 @@ def process_pdf():
             elements_by_page = apply_google_ocr_to_elements(elements_by_page, image_paths)
         except Exception as e:
             ocr_error = f"Google OCR failed: {e}"
-    elif ocr_model == "rapidocr":
+    elif ocr_model == "easyocr":
         try:
-            elements_by_page = apply_rapidocr_to_elements(elements_by_page, image_paths)
+            elements_by_page = apply_easyocr_to_elements(elements_by_page, image_paths)
         except Exception as e:
-            ocr_error = f"RapidOCR failed: {e}"
+            ocr_error = f"EasyOCR failed: {e}"
 
     # Build response
     pages = []
@@ -546,6 +557,8 @@ def process_pdf():
         resp["docling_warning"] = f"Docling processing failed: {docling_error}"
     if ocr_error:
         resp["ocr_warning"] = ocr_error
+    if ocr_model != "none":
+        resp["ocr_used"] = _OCR_LABELS.get(ocr_model, ocr_model)
 
     return jsonify(resp)
 
@@ -637,8 +650,8 @@ def ocr_region():
     """
     Run OCR on a specific bounding box region of a page image.
     Expects JSON: { image_filename: str, bbox_norm: {x1, y1, x2, y2},
-                    ocr_model: "google" | "rapidocr"  (optional, default "google") }
-    Returns: { text: str }
+                    ocr_model: "google" | "easyocr"  (optional, default "google") }
+    Returns: { text: str, ocr_used: str }
     """
     data = request.json
     if not data:
@@ -667,7 +680,7 @@ def ocr_region():
 
         cropped = img.crop((x1, y1, x2, y2))
         text = _ocr_crop_pil(cropped, ocr_model)
-        return jsonify({"text": text})
+        return jsonify({"text": text, "ocr_used": _OCR_LABELS.get(ocr_model, ocr_model)})
     except Exception as e:
         return jsonify({"error": f"OCR failed: {e}"}), 500
 
@@ -765,7 +778,7 @@ def redetect_tables():
     """
     Re-detect tables on a single page using the CV-based TableDetector
     (table_detection.py) and populate cell text with the selected OCR engine.
-    Accepts optional field ``ocr_model``: ``"google"`` (default) or ``"rapidocr"``.
+    Accepts optional field ``ocr_model``: ``"google"`` (default) or ``"easyocr"``.
     Returns table elements in the same format as /process.
     """
     data = request.json
@@ -799,11 +812,11 @@ def redetect_tables():
         detections = detector.detect(cv_img, page_no)
 
         # Prepare OCR engine once for all cells
-        if ocr_model == "rapidocr":
-            rapid_engine = _get_rapidocr_engine()
+        if ocr_model == "easyocr":
+            easy_reader = _get_easyocr_reader()
             _google_ocr_inst = None
         else:
-            rapid_engine = None
+            easy_reader = None
             api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
             _google_ocr_inst = GoogleOCR(api_key=api_key)
 
@@ -817,10 +830,10 @@ def redetect_tables():
                     continue
                 cropped = pil_img.crop((x1, y1, x2, y2))
                 try:
-                    if ocr_model == "rapidocr":
+                    if ocr_model == "easyocr":
                         img_array = np.array(cropped)
-                        result, _ = rapid_engine(img_array)
-                        text = _rapidocr_text_from_result(result)
+                        result = easy_reader.readtext(img_array)
+                        text = _easyocr_text_from_result(result)
                     else:
                         text = _ocr_crop_pil(cropped, "google", _google_ocr_inst)
                     if text:
@@ -885,6 +898,7 @@ def redetect_tables():
             "tables": table_elements,
             "all_elements": table_elements,
             "page_no": page_no,
+            "ocr_used": _OCR_LABELS.get(ocr_model, ocr_model),
         })
 
     except Exception as e:
@@ -908,7 +922,7 @@ def ocr_table_cells():
         "table_rows": [ 0.0, 0.3, ... ],   // normalised y positions of row dividers
         "table_cols": [ 0.0, 0.5, ... ],   // normalised x positions of col dividers
         "table_html": str,                  // existing HTML (for header detection)
-        "ocr_model":  "google" | "rapidocr"  (optional, default "google")
+        "ocr_model":  "google" | "easyocr"  (optional, default "google")
     }
     Returns: { "table_html": str }
     """
@@ -993,11 +1007,11 @@ def ocr_table_cells():
             pass
 
         # Prepare OCR engine once for all cells
-        if ocr_model == "rapidocr":
-            rapid_engine = _get_rapidocr_engine()
+        if ocr_model == "easyocr":
+            easy_reader = _get_easyocr_reader()
             _google_ocr_inst = None
         else:
-            rapid_engine = None
+            easy_reader = None
             api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
             _google_ocr_inst = GoogleOCR(api_key=api_key)
 
@@ -1015,10 +1029,10 @@ def ocr_table_cells():
                 if cx2 - cx1 >= 4 and cy2 - cy1 >= 4:
                     cropped = img.crop((cx1, cy1, cx2, cy2))
                     try:
-                        if ocr_model == "rapidocr":
+                        if ocr_model == "easyocr":
                             img_arr = np.array(cropped)
-                            result, _ = rapid_engine(img_arr)
-                            cell_text = _rapidocr_text_from_result(result)
+                            result = easy_reader.readtext(img_arr)
+                            cell_text = _easyocr_text_from_result(result)
                         else:
                             cell_text = _ocr_crop_pil(cropped, "google", _google_ocr_inst)
                     except Exception:
@@ -1035,7 +1049,7 @@ def ocr_table_cells():
             rows_html.append("<tr>" + "".join(cells_html) + "</tr>")
 
         new_html = "<table>" + "".join(rows_html) + "</table>"
-        return jsonify({"table_html": new_html})
+        return jsonify({"table_html": new_html, "ocr_used": _OCR_LABELS.get(ocr_model, ocr_model)})
 
     except Exception as e:
         return jsonify({"error": f"OCR table cells failed: {e}"}), 500
