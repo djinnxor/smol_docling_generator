@@ -521,7 +521,7 @@
       <button class="btn btn-secondary" onclick="changePage(1)" id="btn-next" disabled>Next ▶</button>
       <button class="btn btn-danger" onclick="removePage()" id="btn-remove-page" disabled title="Remove current page from annotations">🗑 Remove Page</button>
       <button class="btn btn-secondary" onclick="restorePage()" id="btn-restore-page" style="display:none" title="Restore removed page">↩ Restore Page</button>
-      <button class="btn btn-secondary" onclick="redetectTables()" id="btn-redetect" disabled title="Re-run table detection on current page">🔍 Re-detect Tables</button>
+      <button class="btn btn-secondary" onclick="redetectTables()" id="btn-redetect" disabled title="Re-run table detection on current page (uses the OCR model selected above)">🔍 Re-detect Tables</button>
       <div id="mode-buttons">
         <button class="mode-btn active" id="mode-select" onclick="setMode('select')" title="Select mode (click to pick an element)">↖ Select</button>
         <button class="mode-btn" id="mode-draw" onclick="setMode('draw')" title="Draw mode (drag to create new element)">✏️ Draw</button>
@@ -586,7 +586,7 @@
           <button class="btn btn-success" onclick="applyEdit()">✔ Apply</button>
           <button class="btn btn-danger" onclick="deleteSelected()">🗑 Delete</button>
           <button class="btn btn-secondary" onclick="deselectElement()">✕ Cancel</button>
-          <button class="btn btn-secondary" id="btn-ocr-region" onclick="ocrRegion()" title="Run Google OCR on the selected element's region">🔍 OCR Region</button>
+          <button class="btn btn-secondary" id="btn-ocr-region" onclick="ocrRegion()" title="Run OCR on the selected element's region (uses the OCR model selected in the toolbar)">🔍 OCR Region</button>
         </div>
 
         <!-- Table structure editor (visible for table elements only) -->
@@ -598,7 +598,7 @@
             <button class="btn btn-secondary" onclick="removeTableRow()">− Row</button>
             <button class="btn btn-secondary" onclick="addTableCol()">+ Col</button>
             <button class="btn btn-secondary" onclick="removeTableCol()">− Col</button>
-            <button class="btn btn-warning" onclick="ocrAllCells()" title="Run Google OCR on every cell">🔍 OCR All Cells</button>
+            <button class="btn btn-warning" onclick="ocrAllCells()" title="Run OCR on every cell (uses the OCR model selected in the toolbar)">🔍 OCR All Cells</button>
           </div>
         </div>
 
@@ -1675,12 +1675,14 @@ function bboxOverlap(a, b) {
 async function redetectTables() {
   if (!state.totalPages || !state.pdfFilename) { toast('Load a PDF first.', 'error'); return; }
 
-  showSpinner(`Re-detecting tables on page ${state.currentPage}…`);
+  const ocrModel = document.getElementById('ocr-model-select').value;
+  const ocrLabel = ocrModel === 'rapidocr' ? 'RapidOCR' : ocrModel === 'google' ? 'Google OCR' : 'no OCR';
+  showSpinner(`Re-detecting tables on page ${state.currentPage} (${ocrLabel})…`);
   try {
     const resp = await fetch('/redetect_tables', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pdf_filename: state.pdfFilename, page_no: state.currentPage }),
+      body: JSON.stringify({ pdf_filename: state.pdfFilename, page_no: state.currentPage, ocr_model: ocrModel }),
     });
     const data = await resp.json();
     if (data.error) { toast(data.error, 'error'); return; }
@@ -1719,12 +1721,14 @@ async function ocrRegion() {
   const imgFilename = imgUrl.replace(/^.*\//, '');
   if (!imgFilename) { toast('Page image not available.', 'error'); return; }
 
-  showSpinner('Running Google OCR on region…');
+  const ocrModel = document.getElementById('ocr-model-select').value;
+  const ocrLabel = ocrModel === 'rapidocr' ? 'RapidOCR' : 'Google OCR';
+  showSpinner(`Running ${ocrLabel} on region…`);
   try {
     const resp = await fetch('/ocr_region', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image_filename: imgFilename, bbox_norm: el.bbox_norm }),
+      body: JSON.stringify({ image_filename: imgFilename, bbox_norm: el.bbox_norm, ocr_model: ocrModel }),
     });
     const data = await resp.json();
     hideSpinner();
@@ -1864,7 +1868,9 @@ async function ocrAllCells() {
   const imgFilename = imgUrl.replace(/^.*\//, '');
   if (!imgFilename) { toast('Page image not available.', 'error'); return; }
 
-  showSpinner('Running OCR on all cells…');
+  const ocrModel = document.getElementById('ocr-model-select').value;
+  const ocrLabel = ocrModel === 'rapidocr' ? 'RapidOCR' : 'Google OCR';
+  showSpinner(`Running ${ocrLabel} on all cells…`);
   try {
     const resp = await fetch('/ocr_table_cells', {
       method: 'POST',
@@ -1875,6 +1881,7 @@ async function ocrAllCells() {
         table_rows: el.table_rows || [],
         table_cols: el.table_cols || [],
         table_html: el.table_html || '',
+        ocr_model: ocrModel,
       }),
     });
     const data = await resp.json();

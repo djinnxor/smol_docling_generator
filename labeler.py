@@ -20,6 +20,7 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory
+import numpy as np
 from PIL import Image
 from werkzeug.utils import secure_filename
 from google_ocr import GoogleOCR
@@ -366,19 +367,7 @@ def apply_rapidocr_to_elements(elements_by_page, image_paths):
     Crops each element's bounding box from the page image and OCRs the region.
     Labels that typically contain no text (e.g. 'picture') are skipped.
     """
-    try:
-        from rapidocr_onnxruntime import RapidOCR
-    except ImportError:
-        try:
-            from rapidocr_openvino import RapidOCR
-        except ImportError:
-            raise ImportError(
-                "RapidOCR is not installed. Run: pip install rapidocr-onnxruntime"
-            )
-
-    import numpy as np
-
-    engine = RapidOCR()
+    engine = _get_rapidocr_engine()
     skip_labels = {"picture"}
 
     for page_no, img_path in enumerate(image_paths, 1):
@@ -404,15 +393,81 @@ def apply_rapidocr_to_elements(elements_by_page, image_paths):
             img_array = np.array(cropped)
             try:
                 result, _ = engine(img_array)
-                if result:
-                    lines = [r[1] for r in result if r and len(r) > 1 and r[1]]
-                    text = "\n".join(lines)
-                    if text.strip():
-                        el["content"] = text.strip()
+                text = _rapidocr_text_from_result(result)
+                if text:
+                    el["content"] = text
             except Exception:
                 pass
 
     return elements_by_page
+
+
+# ---------------------------------------------------------------------------
+# Shared OCR helpers used by the route handlers below
+# ---------------------------------------------------------------------------
+
+def _get_rapidocr_engine():
+    """Return a RapidOCR engine instance (raises ImportError if not installed)."""
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except ImportError:
+        try:
+            from rapidocr_openvino import RapidOCR
+        except ImportError:
+            raise ImportError(
+                "RapidOCR is not installed. Run: pip install rapidocr-onnxruntime"
+            )
+    return RapidOCR()
+
+
+def _rapidocr_text_from_result(result) -> str:
+    """Extract a plain text string from a RapidOCR result tuple.
+
+    Each detected line is a tuple ``(bbox, text, confidence)``.  Lines are
+    joined with a space so the output matches single-line text regions.
+    """
+    if not result:
+        return ""
+    lines = [r[1] for r in result if r and len(r) > 1 and r[1]]
+    return " ".join(lines).strip()
+
+
+def _ocr_crop_pil(
+    cropped_pil,
+    ocr_model: str,
+    google_ocr: "GoogleOCR | None" = None,
+) -> str:
+    """Run OCR on a PIL Image crop and return the extracted text string.
+
+    Parameters
+    ----------
+    cropped_pil:
+        A :class:`PIL.Image.Image` crop of the region to recognise.
+    ocr_model:
+        ``"google"`` for Google Vision OCR, ``"rapidocr"`` for RapidOCR.
+    google_ocr:
+        An already-constructed :class:`GoogleOCR` instance (used when
+        *ocr_model* is ``"google"``).  If *None* a new instance is created
+        using the ``GOOGLE_OCR_API_KEY`` env var.
+    """
+    if ocr_model == "rapidocr":
+        engine = _get_rapidocr_engine()
+        img_array = np.array(cropped_pil)
+        result, _ = engine(img_array)
+        return _rapidocr_text_from_result(result)
+
+    # Default: Google Vision OCR
+    if google_ocr is None:
+        api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+        google_ocr = GoogleOCR(api_key=api_key)
+    tmp_path = os.path.join(UPLOAD_FOLDER, f"_ocr_{uuid.uuid4().hex}.png")
+    cropped_pil.save(tmp_path, "PNG")
+    try:
+        return google_ocr.google_vision_ocr(tmp_path).strip()
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
 
 @app.route("/")
 def index():
@@ -579,8 +634,9 @@ def load_annotations(filename):
 @app.route("/ocr_region", methods=["POST"])
 def ocr_region():
     """
-    Run Google OCR on a specific bounding box region of a page image.
-    Expects JSON: { image_filename: str, bbox_norm: {x1, y1, x2, y2} }
+    Run OCR on a specific bounding box region of a page image.
+    Expects JSON: { image_filename: str, bbox_norm: {x1, y1, x2, y2},
+                    ocr_model: "google" | "rapidocr"  (optional, default "google") }
     Returns: { text: str }
     """
     data = request.json
@@ -589,6 +645,7 @@ def ocr_region():
 
     image_filename = data.get("image_filename", "")
     bbox_norm = data.get("bbox_norm", {})
+    ocr_model = data.get("ocr_model", "google")
 
     if not image_filename:
         return jsonify({"error": "image_filename is required"}), 400
@@ -608,17 +665,8 @@ def ocr_region():
             return jsonify({"error": "Bounding box too small"}), 400
 
         cropped = img.crop((x1, y1, x2, y2))
-        tmp_path = os.path.join(UPLOAD_FOLDER, f"_ocr_{uuid.uuid4().hex}.png")
-        cropped.save(tmp_path, "PNG")
-        try:
-            api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
-            ocr = GoogleOCR(api_key=api_key)
-            text = ocr.google_vision_ocr(tmp_path)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-        return jsonify({"text": text.strip()})
+        text = _ocr_crop_pil(cropped, ocr_model)
+        return jsonify({"text": text})
     except Exception as e:
         return jsonify({"error": f"OCR failed: {e}"}), 500
 
@@ -715,7 +763,8 @@ def export_xml():
 def redetect_tables():
     """
     Re-detect tables on a single page using the CV-based TableDetector
-    (table_detection.py) and populate cell text with Google OCR.
+    (table_detection.py) and populate cell text with the selected OCR engine.
+    Accepts optional field ``ocr_model``: ``"google"`` (default) or ``"rapidocr"``.
     Returns table elements in the same format as /process.
     """
     data = request.json
@@ -724,6 +773,7 @@ def redetect_tables():
 
     pdf_filename = data.get("pdf_filename", "")
     page_no = int(data.get("page_no", 1))
+    ocr_model = data.get("ocr_model", "google")
 
     if not pdf_filename:
         return jsonify({"error": "pdf_filename is required"}), 400
@@ -747,9 +797,14 @@ def redetect_tables():
         detector = TableDetector()
         detections = detector.detect(cv_img, page_no)
 
-        # OCR each cell using Google Vision
-        api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
-        ocr = GoogleOCR(api_key=api_key)
+        # Prepare OCR engine once for all cells
+        if ocr_model == "rapidocr":
+            rapid_engine = _get_rapidocr_engine()
+            _google_ocr_inst = None
+        else:
+            rapid_engine = None
+            api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+            _google_ocr_inst = GoogleOCR(api_key=api_key)
 
         for det in detections:
             for cell in det.cells:
@@ -760,17 +815,17 @@ def redetect_tables():
                 if x2 - x1 < 4 or y2 - y1 < 4:
                     continue
                 cropped = pil_img.crop((x1, y1, x2, y2))
-                tmp_path = os.path.join(UPLOAD_FOLDER, f"_cell_{uuid.uuid4().hex}.png")
-                cropped.save(tmp_path, "PNG")
                 try:
-                    text = ocr.google_vision_ocr(tmp_path)
-                    if text.strip():
-                        cell.text = text.strip()
+                    if ocr_model == "rapidocr":
+                        img_array = np.array(cropped)
+                        result, _ = rapid_engine(img_array)
+                        text = _rapidocr_text_from_result(result)
+                    else:
+                        text = _ocr_crop_pil(cropped, "google", _google_ocr_inst)
+                    if text:
+                        cell.text = text
                 except Exception:
                     pass
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
 
             # Rebuild HTML with OCR text
             num_rows = max((c.row for c in det.cells), default=0) + 1
@@ -833,6 +888,156 @@ def redetect_tables():
 
     except Exception as e:
         return jsonify({"error": f"Re-detection failed: {e}"}), 500
+
+
+@app.route("/ocr_table_cells", methods=["POST"])
+def ocr_table_cells():
+    """
+    Run OCR on every individual cell of a manually structured table.
+
+    The frontend sends the page image filename, the table's normalised
+    bounding box, and arrays of row/column separator positions.  Each cell
+    is cropped, OCR-ed with the selected engine, and the resulting text is
+    written into a rebuilt HTML ``<table>``.
+
+    Expects JSON:
+    {
+        "image_filename": str,
+        "bbox_norm":  { x1, y1, x2, y2 },
+        "table_rows": [ 0.0, 0.3, ... ],   // normalised y positions of row dividers
+        "table_cols": [ 0.0, 0.5, ... ],   // normalised x positions of col dividers
+        "table_html": str,                  // existing HTML (for header detection)
+        "ocr_model":  "google" | "rapidocr"  (optional, default "google")
+    }
+    Returns: { "table_html": str }
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    image_filename = data.get("image_filename", "")
+    bbox_norm = data.get("bbox_norm", {})
+    table_rows = data.get("table_rows", [])
+    table_cols = data.get("table_cols", [])
+    existing_html = data.get("table_html", "")
+    ocr_model = data.get("ocr_model", "google")
+
+    if not image_filename:
+        return jsonify({"error": "image_filename is required"}), 400
+
+    img_path = os.path.join(UPLOAD_FOLDER, secure_filename(Path(image_filename).name))
+    if not os.path.exists(img_path):
+        return jsonify({"error": f"Image not found: {image_filename}"}), 404
+
+    try:
+        img = Image.open(img_path)
+        img_w, img_h = img.size
+
+        # Absolute pixel coordinates of the table bounding box
+        tx1 = int(bbox_norm.get("x1", 0) * img_w)
+        ty1 = int(bbox_norm.get("y1", 0) * img_h)
+        tx2 = int(bbox_norm.get("x2", 1) * img_w)
+        ty2 = int(bbox_norm.get("y2", 1) * img_h)
+        tbl_w = max(1, tx2 - tx1)
+        tbl_h = max(1, ty2 - ty1)
+
+        # Build cell grid from divider positions.
+        # table_rows / table_cols are normalised positions *within* the table box.
+        def _row_boundaries():
+            ys = sorted({0.0} | {r for r in table_rows if 0.0 < r < 1.0} | {1.0})
+            return list(zip(ys[:-1], ys[1:]))
+
+        def _col_boundaries():
+            xs = sorted({0.0} | {c for c in table_cols if 0.0 < c < 1.0} | {1.0})
+            return list(zip(xs[:-1], xs[1:]))
+
+        row_bounds = _row_boundaries()
+        col_bounds = _col_boundaries()
+
+        if not row_bounds or not col_bounds:
+            return jsonify({"error": "No valid row/col dividers provided"}), 400
+
+        # Pre-parse existing HTML to preserve header (th) tags
+        existing_header_flags: dict[tuple, bool] = {}
+        try:
+            import html.parser as _hp
+
+            class _HeaderParser(_hp.HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self._row = -1
+                    self._col = -1
+                    self._in_cell = False
+                    self._is_header = False
+                    self.flags: dict[tuple, bool] = {}
+
+                def handle_starttag(self, tag, attrs):
+                    if tag == "tr":
+                        self._row += 1
+                        self._col = -1
+                    elif tag in ("td", "th"):
+                        self._col += 1
+                        self._in_cell = True
+                        self._is_header = (tag == "th")
+
+                def handle_endtag(self, tag):
+                    if tag in ("td", "th"):
+                        self.flags[(self._row, self._col)] = self._is_header
+                        self._in_cell = False
+
+            p = _HeaderParser()
+            p.feed(existing_html)
+            existing_header_flags = p.flags
+        except Exception:
+            pass
+
+        # Prepare OCR engine once for all cells
+        if ocr_model == "rapidocr":
+            rapid_engine = _get_rapidocr_engine()
+            _google_ocr_inst = None
+        else:
+            rapid_engine = None
+            api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+            _google_ocr_inst = GoogleOCR(api_key=api_key)
+
+        # Build new HTML table
+        rows_html = []
+        for ri, (r0, r1) in enumerate(row_bounds):
+            cells_html = []
+            for ci, (c0, c1) in enumerate(col_bounds):
+                # Cell pixel coords (absolute in page image)
+                cx1 = tx1 + int(c0 * tbl_w)
+                cy1 = ty1 + int(r0 * tbl_h)
+                cx2 = tx1 + int(c1 * tbl_w)
+                cy2 = ty1 + int(r1 * tbl_h)
+                cell_text = ""
+                if cx2 - cx1 >= 4 and cy2 - cy1 >= 4:
+                    cropped = img.crop((cx1, cy1, cx2, cy2))
+                    try:
+                        if ocr_model == "rapidocr":
+                            img_arr = np.array(cropped)
+                            result, _ = rapid_engine(img_arr)
+                            cell_text = _rapidocr_text_from_result(result)
+                        else:
+                            cell_text = _ocr_crop_pil(cropped, "google", _google_ocr_inst)
+                    except Exception:
+                        pass
+                is_header = existing_header_flags.get((ri, ci), False)
+                tag = "th" if is_header else "td"
+                safe_text = (
+                    cell_text
+                    .replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+                )
+                cells_html.append(f"<{tag}>{safe_text}</{tag}>")
+            rows_html.append("<tr>" + "".join(cells_html) + "</tr>")
+
+        new_html = "<table>" + "".join(rows_html) + "</table>"
+        return jsonify({"table_html": new_html})
+
+    except Exception as e:
+        return jsonify({"error": f"OCR table cells failed: {e}"}), 500
 
 
 # ---------------------------------------------------------------------------
