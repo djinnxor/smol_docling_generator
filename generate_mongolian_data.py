@@ -13,12 +13,23 @@ Key efficiency features:
   - Column-projection on parquet files: downloads only the 'texts' column,
     completely skipping heavy image data
   - Configurable shard selection: process only the shards you need
+  - Instance range selection: stream only a specific range of rows
   - Batch translation to minimise API round-trips
   - Supports offline translation via argostranslate
+
+Multi-page document support:
+  - Dataset rows with multiple pages are handled as a group
+  - Pages are rendered as separate images (mn_page_00001_01.png, _02.png …)
+  - Per-page annotations AND a combined annotation (using <page_break>
+    to distinguish pages) are both written to the output JSONL
 
 Usage:
     # Generate 100 translated samples (default)
     python generate_mongolian_data.py --output mongolian_data.jsonl
+
+    # Process instances 50–150 only
+    python generate_mongolian_data.py --output mongolian_data.jsonl \\
+        --start-instance 50 --end-instance 150
 
     # Process more samples from more parquet shards
     python generate_mongolian_data.py --output mongolian_data.jsonl \\
@@ -31,6 +42,9 @@ Usage:
     # Also render translated DocTags to PNG images for training
     python generate_mongolian_data.py --output mongolian_data.jsonl \\
         --render --render-dir mongolian_renders/
+
+    # Append to an existing JSONL instead of overwriting
+    python generate_mongolian_data.py --output mongolian_data.jsonl --append
 
     # Train/val split
     python generate_mongolian_data.py --output mongolian_data.jsonl \\
@@ -308,6 +322,7 @@ def _extract_doctags_from_texts(texts) -> list[str]:
 
 
 _DOCTAG_BLOCK_RE = re.compile(r"<doctag>.*?</doctag>", re.DOTALL)
+_DOCTAG_INNER_RE = re.compile(r"<doctag>(.*?)</doctag>", re.DOTALL)
 
 
 def _find_doctag_blocks(text: str) -> list[str]:
@@ -315,29 +330,65 @@ def _find_doctag_blocks(text: str) -> list[str]:
     return _DOCTAG_BLOCK_RE.findall(text)
 
 
+def combine_doctag_pages(page_doctags: list[str]) -> str:
+    """Combine multiple page DocTag strings into one using ``<page_break>``.
+
+    The inner content of each ``<doctag>…</doctag>`` block is extracted and
+    joined with ``<page_break>`` so that the resulting string is a single
+    multi-page doctag.  A single-element list is returned unchanged.
+    """
+    if len(page_doctags) == 1:
+        return page_doctags[0]
+    parts: list[str] = []
+    for dt in page_doctags:
+        m = _DOCTAG_INNER_RE.search(dt)
+        parts.append(m.group(1) if m else dt)
+    return "<doctag>" + "\n<page_break>\n".join(parts) + "</doctag>"
+
+
 def load_doctags_from_doclingmatix(
     *,
     max_shards: int = 1,
     limit: int = 100,
     hf_token: str | None = None,
-) -> list[str]:
+    start_instance: int = 0,
+    end_instance: int | None = None,
+) -> list[list[str]]:
     """Load DocTag strings from HuggingFaceM4/DoclingMatix.
 
     Uses direct parquet column-projection to read ONLY the ``texts``
     column, completely bypassing image data for maximum speed.
 
     Falls back to ``datasets`` streaming if direct parquet reading fails.
-    """
-    print(f"Loading DoclingMatix (max_shards={max_shards}, limit={limit}) …")
 
-    doctags = _load_via_parquet(
+    Returns a list of *groups*.  Each group is the list of page DocTag
+    strings extracted from a single dataset row, so a multi-page document
+    becomes a group with more than one element.
+
+    Parameters
+    ----------
+    start_instance:
+        First dataset row index to process (0-based, inclusive).
+    end_instance:
+        Last dataset row index to process (exclusive).  ``None`` means
+        process until *limit* groups are collected.
+    """
+    range_info = f"instances [{start_instance}, {end_instance or 'end'})"
+    print(f"Loading DoclingMatix (max_shards={max_shards}, limit={limit}, "
+          f"{range_info}) …")
+
+    groups = _load_via_parquet(
         max_shards=max_shards, limit=limit, hf_token=hf_token,
+        start_instance=start_instance, end_instance=end_instance,
     )
-    if doctags is not None:
-        return doctags
+    if groups is not None:
+        return groups
 
     print("Direct parquet loading failed; falling back to datasets streaming …")
-    return _load_via_streaming(limit=limit, hf_token=hf_token)
+    return _load_via_streaming(
+        limit=limit, hf_token=hf_token,
+        start_instance=start_instance, end_instance=end_instance,
+    )
 
 
 def _load_via_parquet(
@@ -345,11 +396,18 @@ def _load_via_parquet(
     max_shards: int,
     limit: int,
     hf_token: str | None,
-) -> list[str] | None:
+    start_instance: int = 0,
+    end_instance: int | None = None,
+) -> list[list[str]] | None:
     """Read DocTag strings directly from parquet files on the Hub.
 
     Returns None if the required libraries are unavailable or the
     parquet files cannot be listed.
+
+    Returns a list of groups (one per dataset row that contained at least
+    one DocTag block).  Rows are skipped until *start_instance* is reached
+    and processing stops when *end_instance* is reached or *limit* groups
+    have been collected.
     """
     try:
         from huggingface_hub import HfFileSystem
@@ -376,32 +434,50 @@ def _load_via_parquet(
     print(f"  Found {len(parquet_files)} parquet shards; "
           f"processing {len(shards)} …")
 
-    doctags: list[str] = []
+    doctag_groups: list[list[str]] = []
+    row_counter = 0
     for shard_path in shards:
-        if len(doctags) >= limit:
+        if len(doctag_groups) >= limit:
             break
         print(f"  Reading {shard_path.split('/')[-1]} …")
         try:
             with fs.open(shard_path) as fh:
                 table = pq.read_table(fh, columns=["texts"])
             for i in range(len(table)):
-                if len(doctags) >= limit:
+                if end_instance is not None and row_counter >= end_instance:
+                    break
+                if row_counter < start_instance:
+                    row_counter += 1
+                    continue
+                if len(doctag_groups) >= limit:
                     break
                 texts = table.column("texts")[i].as_py()
                 found = _extract_doctags_from_texts(texts)
-                doctags.extend(found)
+                if found:
+                    doctag_groups.append(found)
+                row_counter += 1
         except Exception as exc:
             print(f"  [warn] Failed to read shard: {exc}", file=sys.stderr)
             continue
 
-    print(f"  Extracted {len(doctags)} DocTag strings")
-    return doctags[:limit]
+    total = sum(len(g) for g in doctag_groups)
+    print(f"  Extracted {total} DocTag strings in {len(doctag_groups)} groups")
+    return doctag_groups[:limit]
 
 
 def _load_via_streaming(
-    *, limit: int, hf_token: str | None,
-) -> list[str]:
-    """Fallback: use ``datasets`` streaming mode."""
+    *,
+    limit: int,
+    hf_token: str | None,
+    start_instance: int = 0,
+    end_instance: int | None = None,
+) -> list[list[str]]:
+    """Fallback: use ``datasets`` streaming mode.
+
+    Rows before *start_instance* are skipped; processing stops when
+    *end_instance* is reached or *limit* groups have been collected.
+    Returns a list of groups (same structure as :func:`_load_via_parquet`).
+    """
     try:
         from datasets import load_dataset  # type: ignore[import-untyped]
     except ImportError:
@@ -423,16 +499,23 @@ def _load_via_streaming(
         **kwargs,
     )
 
-    doctags: list[str] = []
-    for row in ds:
-        if len(doctags) >= limit:
+    doctag_groups: list[list[str]] = []
+    for row_idx, row in enumerate(ds):
+        if end_instance is not None and row_idx >= end_instance:
+            break
+        if row_idx < start_instance:
+            continue
+        if len(doctag_groups) >= limit:
             break
         texts = row.get("texts", [])
         found = _extract_doctags_from_texts(texts)
-        doctags.extend(found)
+        if found:
+            doctag_groups.append(found)
 
-    print(f"  Extracted {len(doctags)} DocTag strings (streaming)")
-    return doctags[:limit]
+    total = sum(len(g) for g in doctag_groups)
+    print(f"  Extracted {total} DocTag strings in "
+          f"{len(doctag_groups)} groups (streaming)")
+    return doctag_groups[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -444,24 +527,37 @@ def save_jsonl(
     output_path: str,
     *,
     source_doctags: list[str] | None = None,
-    image_paths: list[str] | None = None,
+    image_paths: list[str | list[str]] | None = None,
+    append: bool = False,
 ) -> str:
     """Write translated DocTag strings to a JSONL file.
 
-    Each line is a JSON object with at least a ``doctag`` field, and
-    optionally ``source_doctag`` (original English) and ``image``
-    (rendered page path).
+    Each line is a JSON object.  The ``image`` key is written *before* the
+    ``doctag`` key so that image paths are easy to locate at the start of
+    each record.
+
+    When *append* is ``True`` the file is opened in append mode, preserving
+    any existing content.  The default (``False``) overwrites the file.
+
+    Parameters
+    ----------
+    image_paths:
+        Optional list of image paths.  Each element may be either a
+        single path string (single-page) or a list of path strings
+        (multi-page combined annotation).
     """
     p = Path(output_path)
     p.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(p, "w", encoding="utf-8") as fh:
+    mode = "a" if append else "w"
+    with open(p, mode, encoding="utf-8") as fh:
         for i, dt in enumerate(doctags):
-            record: dict = {"doctag": dt}
-            if source_doctags is not None:
-                record["source_doctag"] = source_doctags[i]
+            record: dict = {}
             if image_paths is not None and i < len(image_paths):
                 record["image"] = image_paths[i]
+            record["doctag"] = dt
+            if source_doctags is not None and i < len(source_doctags):
+                record["source_doctag"] = source_doctags[i]
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     return str(p)
@@ -473,7 +569,8 @@ def split_and_save(
     split_ratio: float = 0.9,
     *,
     source_doctags: list[str] | None = None,
-    image_paths: list[str] | None = None,
+    image_paths: list[str | list[str]] | None = None,
+    append: bool = False,
 ) -> tuple[str, str | None]:
     """Split translated data into train/val and save as JSONL files."""
     n = len(doctags)
@@ -490,7 +587,7 @@ def split_and_save(
 
     save_jsonl(
         doctags[:split_idx], train_path,
-        source_doctags=train_sources, image_paths=train_images,
+        source_doctags=train_sources, image_paths=train_images, append=append,
     )
     print(f"Saved {split_idx} training records to {train_path}")
 
@@ -498,7 +595,7 @@ def split_and_save(
     if split_idx < n:
         save_jsonl(
             doctags[split_idx:], val_path,
-            source_doctags=val_sources, image_paths=val_images,
+            source_doctags=val_sources, image_paths=val_images, append=append,
         )
         val_written = val_path
         print(f"Saved {n - split_idx} validation records to {val_path}")
@@ -536,6 +633,140 @@ def render_doctags(
     return paths
 
 
+def render_doctag_groups(
+    doctag_groups: list[list[str]],
+    render_dir: str,
+    *,
+    page_w: int = 1240,
+    page_h: int = 1754,
+    fmt: str = "png",
+) -> list[str | list[str]]:
+    """Render grouped DocTag strings to image files.
+
+    For single-page groups the image is saved as ``mn_page_YYYYY.<fmt>``.
+    For multi-page groups each page is saved as ``mn_page_YYYYY_PP.<fmt>``
+    (PP = 01, 02, …) and the returned entry is a list of those paths.
+
+    Returns a list parallel to *doctag_groups*; each element is either a
+    single path string (single-page) or a list of path strings (multi-page).
+    """
+    from build_document import render_doctag as _render  # type: ignore[import-untyped]
+
+    out_dir = Path(render_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    all_paths: list[str | list[str]] = []
+    total_rendered = 0
+
+    for row_idx, group in enumerate(doctag_groups):
+        row_num = row_idx + 1
+        if len(group) == 1:
+            img = _render(group[0], page_w, page_h)
+            fp = out_dir / f"mn_page_{row_num:05d}.{fmt}"
+            img.save(str(fp))
+            all_paths.append(str(fp))
+            total_rendered += 1
+        else:
+            page_paths: list[str] = []
+            for page_idx, dt in enumerate(group):
+                img = _render(dt, page_w, page_h)
+                fp = out_dir / f"mn_page_{row_num:05d}_{page_idx + 1:02d}.{fmt}"
+                img.save(str(fp))
+                page_paths.append(str(fp))
+                total_rendered += 1
+            all_paths.append(page_paths)
+
+        if total_rendered % 50 == 0 and total_rendered > 0:
+            print(f"  Rendered {total_rendered} pages …")
+
+    print(f"Rendered {total_rendered} pages to {render_dir}")
+    return all_paths
+
+
+# ---------------------------------------------------------------------------
+# Group-aware helpers
+# ---------------------------------------------------------------------------
+
+def batch_translate_doctag_groups(
+    doctag_groups: list[list[str]],
+    translate_fn,
+    *,
+    progress: bool = True,
+) -> list[list[str]]:
+    """Translate groups of DocTag strings, preserving the group structure.
+
+    Flattens *doctag_groups* into a single list, translates it via
+    :func:`batch_translate_doctags`, then re-packs the results into the
+    original group structure.
+    """
+    flat = [dt for group in doctag_groups for dt in group]
+    translated_flat = batch_translate_doctags(flat, translate_fn, progress=progress)
+    result: list[list[str]] = []
+    idx = 0
+    for group in doctag_groups:
+        result.append(translated_flat[idx: idx + len(group)])
+        idx += len(group)
+    return result
+
+
+def _build_save_entries(
+    translated_groups: list[list[str]],
+    image_path_groups: list[str | list[str]] | None,
+    source_groups: list[list[str]] | None,
+) -> tuple[list[str], list[str | list[str]] | None, list[str] | None]:
+    """Expand group-structured data into flat lists for :func:`save_jsonl`.
+
+    For single-page groups one entry is emitted.  For multi-page groups
+    N per-page entries are emitted (separate annotations) followed by one
+    combined entry whose doctag uses ``<page_break>`` to separate pages and
+    whose image field is the full list of page image paths.
+    """
+    save_doctags: list[str] = []
+    save_images: list[str | list[str]] = []
+    save_sources: list[str] = []
+    has_images = image_path_groups is not None
+    has_sources = source_groups is not None
+
+    for row_idx, group in enumerate(translated_groups):
+        img_entry: str | list[str] = (
+            image_path_groups[row_idx] if has_images and image_path_groups else ""
+        )
+        src_group: list[str] = (
+            source_groups[row_idx] if has_sources and source_groups else []
+        )
+
+        if len(group) == 1:
+            save_doctags.append(group[0])
+            if has_images:
+                save_images.append(img_entry)
+            if has_sources and src_group:
+                save_sources.append(src_group[0])
+        else:
+            # --- Per-page separate annotations ---
+            for page_idx, dt in enumerate(group):
+                save_doctags.append(dt)
+                if has_images:
+                    if isinstance(img_entry, list):
+                        save_images.append(img_entry[page_idx])
+                    else:
+                        save_images.append(img_entry)
+                if has_sources and src_group:
+                    save_sources.append(src_group[page_idx])
+
+            # --- Combined annotation with <page_break> ---
+            save_doctags.append(combine_doctag_pages(group))
+            if has_images:
+                save_images.append(img_entry)
+            if has_sources and src_group:
+                save_sources.append(combine_doctag_pages(src_group))
+
+    return (
+        save_doctags,
+        save_images if has_images else None,
+        save_sources if has_sources else None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -548,8 +779,10 @@ def main() -> None:
         epilog=(
             "Examples:\n"
             "  %(prog)s --output mn_data.jsonl --limit 100\n"
+            "  %(prog)s --output mn_data.jsonl --start-instance 50 --end-instance 150\n"
             "  %(prog)s --output mn_data.jsonl --translator argos\n"
             "  %(prog)s --output mn_data.jsonl --render --render-dir mn_pages/\n"
+            "  %(prog)s --output mn_data.jsonl --append\n"
         ),
     )
 
@@ -561,7 +794,15 @@ def main() -> None:
     )
     src.add_argument(
         "--limit", type=int, default=100,
-        help="Maximum number of DocTag samples to process (default: 100)",
+        help="Maximum number of dataset row groups to process (default: 100)",
+    )
+    src.add_argument(
+        "--start-instance", type=int, default=0,
+        help="First dataset row index to process, 0-based (default: 0)",
+    )
+    src.add_argument(
+        "--end-instance", type=int, default=None,
+        help="Last dataset row index to process, exclusive (default: no limit)",
     )
     src.add_argument(
         "--input", "-i", default=None,
@@ -603,6 +844,11 @@ def main() -> None:
         "--keep-source", action="store_true",
         help="Include original English DocTag alongside translation in output",
     )
+    out.add_argument(
+        "--append", action="store_true",
+        help="Append translated annotations to an existing JSONL file "
+             "instead of overwriting it",
+    )
 
     # --- Rendering ---
     rnd = parser.add_argument_group("rendering")
@@ -621,68 +867,84 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # ---- 1. Load DocTag strings ----
+    # ---- 1. Load DocTag strings (grouped by source row) ----
     if args.input:
         from build_document import load_doctags_from_file  # type: ignore[import-untyped]
-        source_doctags = load_doctags_from_file(args.input)
-        print(f"Loaded {len(source_doctags)} DocTag(s) from {args.input}")
+        flat_doctags = load_doctags_from_file(args.input)
+        # Wrap each doctag in its own single-element group
+        source_groups: list[list[str]] = [[dt] for dt in flat_doctags]
+        # Apply instance range if requested
+        source_groups = source_groups[
+            args.start_instance: args.end_instance
+        ]
+        print(f"Loaded {len(source_groups)} DocTag group(s) from {args.input}")
     else:
         hf_token = args.hf_token or os.environ.get("HF_TOKEN")
-        source_doctags = load_doctags_from_doclingmatix(
+        source_groups = load_doctags_from_doclingmatix(
             max_shards=args.max_shards,
             limit=args.limit,
             hf_token=hf_token,
+            start_instance=args.start_instance,
+            end_instance=args.end_instance,
         )
 
-    if not source_doctags:
+    if not source_groups:
         print("No DocTag strings found. Nothing to translate.", file=sys.stderr)
         sys.exit(1)
 
-    # ---- 2. Translate ----
-    print(f"\nTranslating {len(source_doctags)} DocTag(s) "
+    total_pages = sum(len(g) for g in source_groups)
+    print(f"\nTranslating {total_pages} DocTag page(s) across "
+          f"{len(source_groups)} group(s) "
           f"[{args.source_lang}→{args.target_lang}] "
           f"using {args.translator} backend …")
 
+    # ---- 2. Translate ----
     translate_fn = TRANSLATOR_FACTORIES[args.translator](
         args.source_lang, args.target_lang,
     )
 
     t0 = time.time()
-    translated_doctags = batch_translate_doctags(source_doctags, translate_fn)
+    translated_groups = batch_translate_doctag_groups(source_groups, translate_fn)
     elapsed = time.time() - t0
     print(f"Translation complete in {elapsed:.1f}s "
-          f"({len(translated_doctags)} samples)")
+          f"({total_pages} pages in {len(translated_groups)} groups)")
 
     # ---- 3. Optionally render ----
-    image_paths: list[str] | None = None
+    image_path_groups: list[str | list[str]] | None = None
     if args.render:
         print(f"\nRendering translated DocTags to {args.render_dir} …")
-        image_paths = render_doctags(
-            translated_doctags, args.render_dir, fmt=args.render_format,
+        image_path_groups = render_doctag_groups(
+            translated_groups, args.render_dir, fmt=args.render_format,
         )
 
-    # ---- 4. Save ----
-    sources = source_doctags if args.keep_source else None
+    # ---- 4. Build flat save lists (expand multi-page groups) ----
+    src_groups_for_save = source_groups if args.keep_source else None
+    save_doctags, save_images, save_sources = _build_save_entries(
+        translated_groups, image_path_groups, src_groups_for_save,
+    )
 
+    # ---- 5. Save ----
     if args.split_ratio > 0:
         train_path, val_path = split_and_save(
-            image_paths=image_paths,
-            doctags=translated_doctags, output_path=args.output,
+            save_doctags, args.output,
             split_ratio=args.split_ratio,
-            source_doctags=sources,
-            )
+            source_doctags=save_sources,
+            image_paths=save_images,
+            append=args.append,
+        )
         print(f"\nDone! Train: {train_path}")
         if val_path:
             print(f"       Val:   {val_path}")
     else:
         written = save_jsonl(
-            image_paths=image_paths,
-            doctags=translated_doctags, output_path=args.output,
-            source_doctags=sources,
+            save_doctags, args.output,
+            source_doctags=save_sources,
+            image_paths=save_images,
+            append=args.append,
         )
-        print(f"\nDone! Saved {len(translated_doctags)} records to {written}")
+        print(f"\nDone! Saved {len(save_doctags)} records to {written}")
 
-    # ---- 5. Render hint ----
+    # ---- 6. Render hint ----
     if not args.render:
         print(
             "\nTip: to render the translated DocTags to images, re-run with:\n"

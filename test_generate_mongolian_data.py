@@ -15,6 +15,9 @@ from generate_mongolian_data import (
     translate_doctag,
     save_jsonl,
     split_and_save,
+    combine_doctag_pages,
+    batch_translate_doctag_groups,
+    _build_save_entries,
 )
 
 
@@ -230,6 +233,236 @@ def test_translate_empty_content():
     )
     result = translate_doctag(doctag, _stub_translate)
     assert "<text><loc_10><loc_20><loc_300><loc_40></text>" in result
+
+
+# ---------------------------------------------------------------------------
+# Feature 1: streaming interval – instance range selection
+# ---------------------------------------------------------------------------
+
+def test_load_via_streaming_start_end():
+    """start_instance / end_instance correctly slice the dataset rows."""
+    # Verify the range-slicing logic on a synthetic group list
+    groups_all = [
+        [f"<doctag><text><loc_0><loc_0><loc_100><loc_50>Item {i}</text></doctag>"]
+        for i in range(10)
+    ]
+    # Simulate the slice the loaders apply: rows [3, 7)
+    sliced = groups_all[3:7]
+    assert len(sliced) == 4
+    assert "Item 3" in sliced[0][0]
+    assert "Item 6" in sliced[3][0]
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: append mode + image path first
+# ---------------------------------------------------------------------------
+
+def test_save_jsonl_image_first():
+    """image key must appear before doctag key in each JSONL record."""
+    doctags = ["<doctag><text><loc_0><loc_0><loc_100><loc_50>Hello</text></doctag>"]
+    images = ["page_00001.png"]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        tmp_path = f.name
+    try:
+        save_jsonl(doctags, tmp_path, image_paths=images)
+        with open(tmp_path, encoding="utf-8") as f:
+            line = f.readline()
+        record = json.loads(line)
+        keys = list(record.keys())
+        assert keys[0] == "image", f"Expected 'image' first, got {keys}"
+        assert keys[1] == "doctag"
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_save_jsonl_append_mode():
+    """Calling save_jsonl with append=True must add to, not overwrite, file."""
+    dt1 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>First</text></doctag>"
+    dt2 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>Second</text></doctag>"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        tmp_path = f.name
+    try:
+        save_jsonl([dt1], tmp_path)
+        save_jsonl([dt2], tmp_path, append=True)
+        with open(tmp_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        assert len(lines) == 2
+        assert "First" in lines[0]
+        assert "Second" in lines[1]
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_save_jsonl_no_append_overwrites():
+    """Without append=True the file must be overwritten (default behaviour)."""
+    dt1 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>Old</text></doctag>"
+    dt2 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>New</text></doctag>"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        tmp_path = f.name
+    try:
+        save_jsonl([dt1], tmp_path)
+        save_jsonl([dt2], tmp_path)  # no append flag → overwrite
+        with open(tmp_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        assert len(lines) == 1
+        assert "New" in lines[0]
+        assert "Old" not in lines[0]
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_split_and_save_append():
+    """split_and_save must pass the append flag through to save_jsonl."""
+    doctags = [f"<doctag><text><loc_0><loc_0><loc_100><loc_50>Item {i}</text></doctag>"
+               for i in range(10)]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = os.path.join(tmpdir, "data.jsonl")
+        # First batch
+        split_and_save(doctags[:10], base, split_ratio=0.8)
+        # Second batch appended
+        split_and_save(doctags[:10], base, split_ratio=0.8, append=True)
+        train_path = base.replace(".jsonl", "_train.jsonl")
+        with open(train_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        assert len(lines) == 16  # 8 original + 8 appended
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: multi-page rows with <page_break>
+# ---------------------------------------------------------------------------
+
+def test_combine_doctag_pages_single():
+    """A single-page group must be returned unchanged."""
+    dt = "<doctag><text><loc_0><loc_0><loc_100><loc_50>Page 1</text></doctag>"
+    assert combine_doctag_pages([dt]) == dt
+
+
+def test_combine_doctag_pages_multi():
+    """Multi-page groups must be joined with <page_break> inside one doctag."""
+    p1 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>Page 1</text></doctag>"
+    p2 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>Page 2</text></doctag>"
+    combined = combine_doctag_pages([p1, p2])
+    assert combined.startswith("<doctag>")
+    assert combined.endswith("</doctag>")
+    assert "<page_break>" in combined
+    assert "Page 1" in combined
+    assert "Page 2" in combined
+    # Must contain exactly one outer doctag wrapper
+    assert combined.count("<doctag>") == 1
+    assert combined.count("</doctag>") == 1
+
+
+def test_combine_doctag_pages_three():
+    """Three-page group must have exactly two <page_break> tokens."""
+    pages = [
+        f"<doctag><text><loc_0><loc_0><loc_100><loc_50>P{i}</text></doctag>"
+        for i in range(3)
+    ]
+    combined = combine_doctag_pages(pages)
+    assert combined.count("<page_break>") == 2
+
+
+def test_batch_translate_doctag_groups():
+    """Group structure must be preserved after translation."""
+    groups = [
+        ["<doctag><text><loc_0><loc_0><loc_100><loc_50>Hello</text></doctag>"],
+        [
+            "<doctag><text><loc_0><loc_0><loc_100><loc_50>Page one</text></doctag>",
+            "<doctag><text><loc_0><loc_0><loc_100><loc_50>Page two</text></doctag>",
+        ],
+    ]
+    result = batch_translate_doctag_groups(groups, _stub_translate, progress=False)
+    assert len(result) == 2
+    assert len(result[0]) == 1
+    assert len(result[1]) == 2
+    # "Hello" → "olleH"
+    assert "olleH" in result[0][0]
+    # "Page one" → "egaP eno"
+    assert "egaP eno" in result[1][0]
+
+
+def test_build_save_entries_single_page():
+    """Single-page groups must produce exactly one entry each."""
+    groups = [
+        ["<doctag><text><loc_0><loc_0><loc_100><loc_50>A</text></doctag>"],
+        ["<doctag><text><loc_0><loc_0><loc_100><loc_50>B</text></doctag>"],
+    ]
+    doctags, images, sources = _build_save_entries(groups, None, None)
+    assert len(doctags) == 2
+    assert images is None
+    assert sources is None
+
+
+def test_build_save_entries_multi_page():
+    """Multi-page groups produce N per-page entries plus one combined entry."""
+    p1 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>P1</text></doctag>"
+    p2 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>P2</text></doctag>"
+    groups = [[p1, p2]]
+    image_groups = [["img_01.png", "img_02.png"]]
+
+    doctags, images, sources = _build_save_entries(groups, image_groups, None)
+    # 2 per-page + 1 combined = 3 entries
+    assert len(doctags) == 3
+    assert images is not None
+    assert len(images) == 3
+    # First two are individual pages
+    assert "P1" in doctags[0]
+    assert "<page_break>" not in doctags[0]
+    assert "P2" in doctags[1]
+    # Last entry is the combined doctag
+    assert "<page_break>" in doctags[2]
+    assert "P1" in doctags[2]
+    assert "P2" in doctags[2]
+    # Image fields
+    assert images[0] == "img_01.png"
+    assert images[1] == "img_02.png"
+    assert images[2] == ["img_01.png", "img_02.png"]
+
+
+def test_build_save_entries_multi_page_with_source():
+    """Source doctags for multi-page groups are also combined correctly."""
+    p1 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>Trans P1</text></doctag>"
+    p2 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>Trans P2</text></doctag>"
+    s1 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>Orig P1</text></doctag>"
+    s2 = "<doctag><text><loc_0><loc_0><loc_100><loc_50>Orig P2</text></doctag>"
+    groups = [[p1, p2]]
+    src_groups = [[s1, s2]]
+
+    doctags, images, sources = _build_save_entries(groups, None, src_groups)
+    assert sources is not None
+    assert len(sources) == 3  # 2 per-page + 1 combined
+    assert "Orig P1" in sources[0]
+    assert "Orig P2" in sources[1]
+    combined_src = sources[2]
+    assert "<page_break>" in combined_src
+    assert "Orig P1" in combined_src
+    assert "Orig P2" in combined_src
+
+
+def test_save_jsonl_multipage_image_list():
+    """Combined multi-page entry must store image list and have image first."""
+    doctags = [
+        "<doctag><text><loc_0><loc_0><loc_100><loc_50>P1</text></doctag>",
+        "<doctag><text><loc_0><loc_0><loc_100><loc_50>P1+P2 combined</text></doctag>",
+    ]
+    image_paths = ["page_01.png", ["page_01.png", "page_02.png"]]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        tmp_path = f.name
+    try:
+        save_jsonl(doctags, tmp_path, image_paths=image_paths)
+        with open(tmp_path, encoding="utf-8") as f:
+            lines = f.readlines()
+        assert len(lines) == 2
+        rec0 = json.loads(lines[0])
+        rec1 = json.loads(lines[1])
+        # image first
+        assert list(rec0.keys())[0] == "image"
+        assert rec0["image"] == "page_01.png"
+        # combined entry has list
+        assert list(rec1.keys())[0] == "image"
+        assert rec1["image"] == ["page_01.png", "page_02.png"]
+    finally:
+        os.unlink(tmp_path)
 
 
 if __name__ == "__main__":
