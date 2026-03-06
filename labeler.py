@@ -11,13 +11,17 @@ Options:
     --no-docling  Skip docling processing (show empty annotations)
 """
 
+import io
 import json
 import os
 import re
 import shutil
+import sqlite3
+import threading
 import uuid
 import argparse
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from xml.dom import minidom
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory
@@ -36,6 +40,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "labeler_data", "uploads")
 ANNOTATIONS_FOLDER = os.path.join(BASE_DIR, "labeler_data", "annotations")
 XML_ANNOTATIONS_FOLDER = os.path.join(BASE_DIR, "labeler_data", "xml_annotations")
+DB_PATH = os.path.join(BASE_DIR, "labeler_data", "annotations.db")
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(ANNOTATIONS_FOLDER, exist_ok=True)
@@ -46,6 +51,69 @@ _OCR_LABELS: dict[str, str] = {
     "google": "Google Vision OCR",
     "easyocr": "EasyOCR",
 }
+
+# ---------------------------------------------------------------------------
+# SQLite database helpers (multi-user annotation storage)
+# ---------------------------------------------------------------------------
+
+_db_write_lock = threading.Lock()
+
+
+def _get_db() -> sqlite3.Connection:
+    """Return a new SQLite connection (caller must close it).
+
+    WAL journal mode is enabled so concurrent reads don't block writers.
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _init_db() -> None:
+    """Create database tables if they don't already exist."""
+    with _get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS annotation_sessions (
+                session_id   TEXT PRIMARY KEY,
+                document_name TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS page_annotations (
+                session_id   TEXT NOT NULL,
+                page_num     INTEGER NOT NULL,
+                image_name   TEXT NOT NULL,
+                width        REAL NOT NULL DEFAULT 0,
+                height       REAL NOT NULL DEFAULT 0,
+                elements_json TEXT NOT NULL DEFAULT '[]',
+                updated_at   TEXT NOT NULL,
+                PRIMARY KEY (session_id, page_num),
+                FOREIGN KEY (session_id)
+                    REFERENCES annotation_sessions(session_id)
+                    ON DELETE CASCADE
+            );
+        """)
+
+
+_init_db()
+
+# ---------------------------------------------------------------------------
+# Google OCR module-level instance cache (loading the OCR object is lightweight
+# but caching avoids repeatedly reading the env-var on every request).
+# ---------------------------------------------------------------------------
+
+_google_ocr_cache: GoogleOCR | None = None
+
+
+def _get_google_ocr() -> GoogleOCR:
+    """Return a cached GoogleOCR instance."""
+    global _google_ocr_cache
+    if _google_ocr_cache is None:
+        api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+        _google_ocr_cache = GoogleOCR(api_key=api_key)
+    return _google_ocr_cache
 
 # All supported docling tag types with display colors
 DOCLING_TAGS = [
@@ -328,9 +396,9 @@ def apply_google_ocr_to_elements(elements_by_page, image_paths):
     Crops the element's bounding box from the page image and OCRs the region.
     Requires the GOOGLE_OCR_API_KEY environment variable to be set.
     Labels that typically contain no text (e.g. 'picture') are skipped.
+    Image crops are encoded in-memory (no temp files written to disk).
     """
-    api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
-    ocr = GoogleOCR(api_key=api_key)
+    ocr = _get_google_ocr()
     skip_labels = {"picture"}
 
     for page_no, img_path in enumerate(image_paths, 1):
@@ -353,17 +421,14 @@ def apply_google_ocr_to_elements(elements_by_page, image_paths):
             if x2 - x1 < 4 or y2 - y1 < 4:
                 continue
             cropped = img.crop((x1, y1, x2, y2))
-            tmp_path = os.path.join(UPLOAD_FOLDER, f"_crop_{uuid.uuid4().hex}.png")
-            cropped.save(tmp_path, "PNG")
+            buf = io.BytesIO()
+            cropped.save(buf, format="PNG")
             try:
-                text = ocr.google_vision_ocr(tmp_path)
+                text = ocr.google_vision_ocr_bytes(buf.getvalue())
                 if text.strip():
                     el["content"] = text.strip()
             except Exception:
                 pass
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
 
     return elements_by_page
 
@@ -459,8 +524,9 @@ def _ocr_crop_pil(
         ``"google"`` for Google Vision OCR, ``"easyocr"`` for EasyOCR.
     google_ocr:
         An already-constructed :class:`GoogleOCR` instance (used when
-        *ocr_model* is ``"google"``).  If *None* a new instance is created
-        using the ``GOOGLE_OCR_API_KEY`` env var.
+        *ocr_model* is ``"google"``).  If *None* the module-level cached
+        instance is used.  Image data is encoded in-memory — no temp file
+        is written to disk.
     """
     if ocr_model == "easyocr":
         reader = _get_easyocr_reader()
@@ -468,17 +534,12 @@ def _ocr_crop_pil(
         result = reader.readtext(img_array)
         return _easyocr_text_from_result(result)
 
-    # Default: Google Vision OCR
+    # Google Vision OCR – encode directly in memory (no temp file I/O)
     if google_ocr is None:
-        api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
-        google_ocr = GoogleOCR(api_key=api_key)
-    tmp_path = os.path.join(UPLOAD_FOLDER, f"_ocr_{uuid.uuid4().hex}.png")
-    cropped_pil.save(tmp_path, "PNG")
-    try:
-        return google_ocr.google_vision_ocr(tmp_path).strip()
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        google_ocr = _get_google_ocr()
+    buf = io.BytesIO()
+    cropped_pil.save(buf, format="PNG")
+    return google_ocr.google_vision_ocr_bytes(buf.getvalue()).strip()
 
 
 @app.route("/")
@@ -628,11 +689,8 @@ def save_annotations():
 
 @app.route("/list_annotations")
 def list_annotations():
-    files = []
-    for fn in os.listdir(ANNOTATIONS_FOLDER):
-        if fn.endswith("_annotations.json"):
-            files.append(fn)
-    return jsonify({"files": sorted(files)})
+    files = sorted(p.name for p in Path(ANNOTATIONS_FOLDER).glob("*_annotations.json"))
+    return jsonify({"files": files})
 
 
 @app.route("/load_annotations/<filename>")
@@ -643,6 +701,195 @@ def load_annotations(filename):
         return jsonify({"error": "File not found"}), 404
     with open(fpath, encoding="utf-8") as f:
         return jsonify(json.load(f))
+
+
+# ---------------------------------------------------------------------------
+# Database-backed annotation routes (multi-user safe)
+# ---------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@app.route("/db/save_annotations", methods=["POST"])
+def db_save_annotations():
+    """Save annotations to the SQLite database.
+
+    Accepts the same JSON payload as ``/save_annotations`` plus an optional
+    ``session_id`` field.  If ``session_id`` is omitted a new UUID is created.
+    This allows multiple users to save annotations for the same document
+    without overwriting each other's work.
+
+    Returns ``{ session_id, num_pages, num_elements }``.
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    pages_data = data.get("pages", {})
+    session_id = data.get("session_id") or str(uuid.uuid4())
+    document_name = data.get("document_name", "unknown")
+    now = _now_iso()
+    total_elements = 0
+
+    with _db_write_lock:
+        with _get_db() as conn:
+            # Upsert session record
+            conn.execute(
+                """
+                INSERT INTO annotation_sessions (session_id, document_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    document_name = excluded.document_name,
+                    updated_at    = excluded.updated_at
+                """,
+                (session_id, document_name, now, now),
+            )
+
+            for p, page_info in sorted(pages_data.items(), key=lambda x: int(x[0])):
+                if isinstance(page_info, list):
+                    elements = page_info
+                    image_name = f"page_{p}"
+                    width, height = 0, 0
+                else:
+                    elements = page_info.get("elements", [])
+                    image_name = page_info.get("image_name", f"page_{p}")
+                    width = page_info.get("width", 0)
+                    height = page_info.get("height", 0)
+
+                safe_image_name = (
+                    secure_filename(re.sub(r"[^\w\-.]", "_", image_name)) or f"page_{p}"
+                )
+                total_elements += len(elements)
+
+                conn.execute(
+                    """
+                    INSERT INTO page_annotations
+                        (session_id, page_num, image_name, width, height, elements_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id, page_num) DO UPDATE SET
+                        image_name    = excluded.image_name,
+                        width         = excluded.width,
+                        height        = excluded.height,
+                        elements_json = excluded.elements_json,
+                        updated_at    = excluded.updated_at
+                    """,
+                    (
+                        session_id,
+                        int(p),
+                        safe_image_name,
+                        width,
+                        height,
+                        json.dumps(elements, ensure_ascii=False),
+                        now,
+                    ),
+                )
+
+    return jsonify({
+        "session_id": session_id,
+        "document_name": document_name,
+        "num_pages": len(pages_data),
+        "num_elements": total_elements,
+    })
+
+
+@app.route("/db/list_sessions")
+def db_list_sessions():
+    """Return all annotation sessions with metadata.
+
+    Optional query parameters:
+      - ``document_name``: filter by document name (substring match)
+    """
+    doc_filter = request.args.get("document_name", "")
+    with _get_db() as conn:
+        if doc_filter:
+            rows = conn.execute(
+                """
+                SELECT s.session_id, s.document_name, s.created_at, s.updated_at,
+                       COUNT(p.page_num) AS num_pages,
+                       SUM(LENGTH(p.elements_json) - LENGTH(REPLACE(p.elements_json, '"id"', '')))
+                           AS approx_elements
+                FROM annotation_sessions s
+                LEFT JOIN page_annotations p USING (session_id)
+                WHERE s.document_name LIKE ?
+                GROUP BY s.session_id
+                ORDER BY s.updated_at DESC
+                """,
+                (f"%{doc_filter}%",),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT s.session_id, s.document_name, s.created_at, s.updated_at,
+                       COUNT(p.page_num) AS num_pages,
+                       SUM(LENGTH(p.elements_json) - LENGTH(REPLACE(p.elements_json, '"id"', '')))
+                           AS approx_elements
+                FROM annotation_sessions s
+                LEFT JOIN page_annotations p USING (session_id)
+                GROUP BY s.session_id
+                ORDER BY s.updated_at DESC
+                """
+            ).fetchall()
+
+    sessions = [dict(r) for r in rows]
+    return jsonify({"sessions": sessions})
+
+
+@app.route("/db/load_annotations/<session_id>")
+def db_load_annotations(session_id):
+    """Return all page annotations for a given session.
+
+    Returns ``{ session_id, document_name, pages: [ {page_num, image_name, width, height, elements} ] }``.
+    """
+    with _get_db() as conn:
+        sess = conn.execute(
+            "SELECT * FROM annotation_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if sess is None:
+            return jsonify({"error": "Session not found"}), 404
+
+        page_rows = conn.execute(
+            """
+            SELECT page_num, image_name, width, height, elements_json
+            FROM page_annotations
+            WHERE session_id = ?
+            ORDER BY page_num
+            """,
+            (session_id,),
+        ).fetchall()
+
+    pages = [
+        {
+            "page_num": r["page_num"],
+            "image_name": r["image_name"],
+            "width": r["width"],
+            "height": r["height"],
+            "elements": json.loads(r["elements_json"]),
+        }
+        for r in page_rows
+    ]
+    return jsonify({
+        "session_id": sess["session_id"],
+        "document_name": sess["document_name"],
+        "created_at": sess["created_at"],
+        "updated_at": sess["updated_at"],
+        "pages": pages,
+    })
+
+
+@app.route("/db/delete_session/<session_id>", methods=["DELETE"])
+def db_delete_session(session_id):
+    """Permanently delete an annotation session and all its page data."""
+    with _db_write_lock:
+        with _get_db() as conn:
+            result = conn.execute(
+                "DELETE FROM annotation_sessions WHERE session_id = ?",
+                (session_id,),
+            )
+    if result.rowcount == 0:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify({"success": True, "deleted_session_id": session_id})
 
 
 @app.route("/ocr_region", methods=["POST"])
@@ -817,8 +1064,7 @@ def redetect_tables():
             _google_ocr_inst = None
         else:
             easy_reader = None
-            api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
-            _google_ocr_inst = GoogleOCR(api_key=api_key)
+            _google_ocr_inst = _get_google_ocr()
 
         for det in detections:
             for cell in det.cells:
@@ -1012,8 +1258,7 @@ def ocr_table_cells():
             _google_ocr_inst = None
         else:
             easy_reader = None
-            api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
-            _google_ocr_inst = GoogleOCR(api_key=api_key)
+            _google_ocr_inst = _get_google_ocr()
 
         # Build new HTML table
         rows_html = []

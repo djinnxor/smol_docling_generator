@@ -6,7 +6,8 @@
 #   docker compose down              # stop and remove container
 #
 # The labeler_data/ directory on your machine is mounted into the container
-# so uploads, annotations, and exported XML files persist across restarts.
+# so uploads, annotations, exported XML files, and the SQLite DB persist
+# across restarts.
 
 services:
   labeler:
@@ -18,12 +19,14 @@ services:
       # Change the left side (e.g. "8080:5000") if port 5000 is already used.
       - "5000:5000"
     volumes:
-      # Persist uploads, annotations and exported XML on the host machine.
-      - ./labeler_data/uploads:/app/labeler_data/uploads
-      - ./labeler_data/annotations:/app/labeler_data/annotations
-      - ./labeler_data/xml_annotations:/app/labeler_data/xml_annotations
+      # Persist uploads, annotations, exported XML and the SQLite DB on the host machine.
+      # A single mount of labeler_data/ covers all subdirectories.
+      - ./labeler_data:/app/labeler_data
     environment:
       # Optional: set your Google Cloud Vision API key to enable Google OCR.
       # Leave blank or remove the line to skip Google OCR.
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - GOOGLE_OCR_API_KEY=${GOOGLE_OCR_API_KEY:-}
+      # Number of gunicorn worker processes (default 4).
+      # Increase for environments with many concurrent users.
+      - WEB_CONCURRENCY=${WEB_CONCURRENCY:-4}
     restart: unless-stopped
