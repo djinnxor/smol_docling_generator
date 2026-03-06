@@ -33,3 +33,4 @@ mongolian_data*.jsonl
 mn-pages/
 smol-docling-labeler.tar
 custom_models/
+labeler_data/annotations.db
