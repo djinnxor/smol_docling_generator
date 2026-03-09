@@ -392,13 +392,13 @@ def process_with_docling(pdf_path):
 
 def apply_google_ocr_to_elements(elements_by_page, image_paths):
     """
-    Replace each element's text content with Google Vision OCR output.
-    Crops the element's bounding box from the page image and OCRs the region.
-    Requires the GOOGLE_OCR_API_KEY environment variable to be set.
-    Labels that typically contain no text (e.g. 'picture') are skipped.
-    Image crops are encoded in-memory (no temp files written to disk).
+    Replace each element's text content using full-page Google Vision OCR.
+
+    OCRs each page image once, then assigns text to elements by matching
+    word-level bounding boxes returned by the Vision API to each element's
+    bbox.  This is significantly faster than the previous per-element crop
+    approach and more accurate because the full-page context is preserved.
     """
-    ocr = _get_google_ocr()
     skip_labels = {"picture"}
 
     for page_no, img_path in enumerate(image_paths, 1):
@@ -406,7 +406,9 @@ def apply_google_ocr_to_elements(elements_by_page, image_paths):
         if not page_elements:
             continue
         img = Image.open(img_path)
-        img_w, img_h = img.size
+        page_words = _ocr_page_words(img, "google")
+        if not page_words:
+            continue
 
         for el in page_elements:
             if el.get("label") in skip_labels:
@@ -414,32 +416,23 @@ def apply_google_ocr_to_elements(elements_by_page, image_paths):
             bbox = el.get("bbox_norm")
             if not bbox:
                 continue
-            x1 = int(bbox["x1"] * img_w)
-            y1 = int(bbox["y1"] * img_h)
-            x2 = int(bbox["x2"] * img_w)
-            y2 = int(bbox["y2"] * img_h)
-            if x2 - x1 < 4 or y2 - y1 < 4:
-                continue
-            cropped = img.crop((x1, y1, x2, y2))
-            buf = io.BytesIO()
-            cropped.save(buf, format="PNG")
-            try:
-                text = ocr.google_vision_ocr_bytes(buf.getvalue())
-                if text.strip():
-                    el["content"] = text.strip()
-            except Exception:
-                pass
+            text = _assign_words_to_bbox(page_words, bbox)
+            if text.strip():
+                el["content"] = text.strip()
 
     return elements_by_page
 
 
 def apply_easyocr_to_elements(elements_by_page, image_paths):
     """
-    Replace each element's text content using EasyOCR.
-    Crops each element's bounding box from the page image and OCRs the region.
-    Labels that typically contain no text (e.g. 'picture') are skipped.
+    Replace each element's text content using full-page EasyOCR.
+
+    OCRs each page once via ``easyocr.Reader.readtext`` on the full page
+    image (matching the approach in ``compare_ocr_models.py``), then assigns
+    text to elements by spatial matching.  Running on the full page gives
+    EasyOCR the character-level context it needs and is far more efficient than
+    per-element cropping.
     """
-    reader = _get_easyocr_reader()
     skip_labels = {"picture"}
 
     for page_no, img_path in enumerate(image_paths, 1):
@@ -447,7 +440,9 @@ def apply_easyocr_to_elements(elements_by_page, image_paths):
         if not page_elements:
             continue
         img = Image.open(img_path)
-        img_w, img_h = img.size
+        page_words = _ocr_page_words(img, "easyocr")
+        if not page_words:
+            continue
 
         for el in page_elements:
             if el.get("label") in skip_labels:
@@ -455,21 +450,9 @@ def apply_easyocr_to_elements(elements_by_page, image_paths):
             bbox = el.get("bbox_norm")
             if not bbox:
                 continue
-            x1 = int(bbox["x1"] * img_w)
-            y1 = int(bbox["y1"] * img_h)
-            x2 = int(bbox["x2"] * img_w)
-            y2 = int(bbox["y2"] * img_h)
-            if x2 - x1 < 4 or y2 - y1 < 4:
-                continue
-            cropped = img.crop((x1, y1, x2, y2))
-            img_array = np.array(cropped)
-            try:
-                result = reader.readtext(img_array)
-                text = _easyocr_text_from_result(result)
-                if text:
-                    el["content"] = text
-            except Exception:
-                pass
+            text = _assign_words_to_bbox(page_words, bbox)
+            if text:
+                el["content"] = text
 
     return elements_by_page
 
@@ -483,7 +466,11 @@ _easyocr_reader_cache = None
 
 
 def _get_easyocr_reader(langs=None):
-    """Return a cached EasyOCR Reader instance (raises ImportError if not installed)."""
+    """Return a cached EasyOCR Reader instance (raises ImportError if not installed).
+
+    ``gpu=False`` is forced so the reader works on CPU-only machines without
+    CUDA errors; this matches the usage pattern in compare_ocr_models.py.
+    """
     global _easyocr_reader_cache
     if _easyocr_reader_cache is not None:
         return _easyocr_reader_cache
@@ -493,7 +480,7 @@ def _get_easyocr_reader(langs=None):
         raise ImportError(
             "EasyOCR is not installed. Run: pip install easyocr"
         )
-    _easyocr_reader_cache = easyocr.Reader(langs or ["en"], verbose=False)
+    _easyocr_reader_cache = easyocr.Reader(langs or ["en"], gpu=False, verbose=False)
     return _easyocr_reader_cache
 
 
@@ -507,6 +494,93 @@ def _easyocr_text_from_result(result) -> str:
         return ""
     lines = [r[1] for r in result if r and len(r) > 1 and r[1]]
     return " ".join(lines).strip()
+
+
+def _ocr_page_words(pil_img: Image.Image, ocr_model: str) -> list:
+    """OCR a full page image and return word-level bounding boxes.
+
+    Performs a single OCR call on the complete page – much faster and more
+    accurate than calling OCR on many small per-element crops, especially for
+    EasyOCR which benefits from having full context.
+
+    Returns a list of dicts::
+
+        {"text": str, "x1": float, "y1": float, "x2": float, "y2": float}
+
+    All coordinates are normalised to ``[0, 1]`` relative to the image size.
+    """
+    img_w, img_h = pil_img.size
+    if img_w == 0 or img_h == 0:
+        return []
+
+    if ocr_model == "easyocr":
+        reader = _get_easyocr_reader()
+        img_array = np.array(pil_img)
+        results = reader.readtext(img_array)
+        words = []
+        for (bbox_pts, text, _conf) in results:
+            if not text.strip():
+                continue
+            # bbox_pts: [[tl_x, tl_y], [tr_x, tr_y], [br_x, br_y], [bl_x, bl_y]]
+            xs = [pt[0] for pt in bbox_pts]
+            ys = [pt[1] for pt in bbox_pts]
+            words.append({
+                "text": text.strip(),
+                "x1": max(0.0, min(1.0, min(xs) / img_w)),
+                "y1": max(0.0, min(1.0, min(ys) / img_h)),
+                "x2": max(0.0, min(1.0, max(xs) / img_w)),
+                "y2": max(0.0, min(1.0, max(ys) / img_h)),
+            })
+        return words
+
+    # Google Vision OCR
+    google_ocr = _get_google_ocr()
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    word_data = google_ocr.google_vision_ocr_words_bytes(buf.getvalue())
+    words = []
+    for w in word_data:
+        if not w.get("text", "").strip():
+            continue
+        verts = w.get("vertices", [])
+        if len(verts) < 4:
+            continue
+        xs = [v[0] for v in verts]
+        ys = [v[1] for v in verts]
+        words.append({
+            "text": w["text"],
+            "x1": max(0.0, min(1.0, min(xs) / img_w)),
+            "y1": max(0.0, min(1.0, min(ys) / img_h)),
+            "x2": max(0.0, min(1.0, max(xs) / img_w)),
+            "y2": max(0.0, min(1.0, max(ys) / img_h)),
+        })
+    return words
+
+
+def _assign_words_to_bbox(words: list, bbox: dict) -> str:
+    """Find OCR words whose centroid falls within *bbox* and return joined text.
+
+    Words are sorted top-to-bottom then left-to-right before joining, so the
+    output preserves natural reading order within the bounding box.
+
+    Parameters
+    ----------
+    words:
+        Output of :func:`_ocr_page_words` – list of
+        ``{"text", "x1", "y1", "x2", "y2"}`` dicts with normalised coords.
+    bbox:
+        Normalised bounding box ``{"x1", "y1", "x2", "y2"}``.
+    """
+    x1, y1, x2, y2 = bbox.get("x1", 0), bbox.get("y1", 0), bbox.get("x2", 1), bbox.get("y2", 1)
+    matched = sorted(
+        (
+            w for w in words
+            if x1 <= (w["x1"] + w["x2"]) / 2 <= x2
+            and y1 <= (w["y1"] + w["y2"]) / 2 <= y2
+        ),
+        key=lambda w: (w["y1"], w["x1"]),
+    )
+    return " ".join(w["text"] for w in matched)
 
 
 def _ocr_crop_pil(
@@ -1154,23 +1228,28 @@ def redetect_tables():
 @app.route("/ocr_table_cells", methods=["POST"])
 def ocr_table_cells():
     """
-    Run OCR on every individual cell of a manually structured table.
+    OCR the full page and distribute text to table cells by spatial location.
 
-    The frontend sends the page image filename, the table's normalised
-    bounding box, and arrays of row/column separator positions.  Each cell
-    is cropped, OCR-ed with the selected engine, and the resulting text is
-    written into a rebuilt HTML ``<table>``.
+    Instead of cropping each cell individually (which requires N×M OCR calls),
+    this endpoint OCRs the full page image once and assigns detected words to
+    cells by checking whether each word's centroid falls within the cell's
+    bounding box.  This is faster, more accurate (full-page context), and works
+    much better with EasyOCR.
 
-    Expects JSON:
-    {
-        "image_filename": str,
-        "bbox_norm":  { x1, y1, x2, y2 },
-        "table_rows": [ 0.0, 0.3, ... ],   // normalised y positions of row dividers
-        "table_cols": [ 0.0, 0.5, ... ],   // normalised x positions of col dividers
-        "table_html": str,                  // existing HTML (for header detection)
-        "ocr_model":  "google" | "easyocr"  (optional, default "google")
-    }
-    Returns: { "table_html": str }
+    Expects JSON::
+
+        {
+            "image_filename": str,
+            "bbox_norm":  { x1, y1, x2, y2 },
+            "table_rows": [ 0.0, 0.3, ... ],   // normalised y separator positions
+            "table_cols": [ 0.0, 0.5, ... ],   // normalised x separator positions
+            "table_html": str,                  // existing HTML (preserves header tags)
+            "ocr_model":  "google" | "easyocr" (optional, default "google")
+        }
+
+    Returns::
+
+        { "table_html": str, "ocr_used": str }
     """
     data = request.json
     if not data:
@@ -1192,105 +1271,49 @@ def ocr_table_cells():
 
     try:
         img = Image.open(img_path)
-        img_w, img_h = img.size
 
-        # Absolute pixel coordinates of the table bounding box
-        tx1 = int(bbox_norm.get("x1", 0) * img_w)
-        ty1 = int(bbox_norm.get("y1", 0) * img_h)
-        tx2 = int(bbox_norm.get("x2", 1) * img_w)
-        ty2 = int(bbox_norm.get("y2", 1) * img_h)
-        tbl_w = max(1, tx2 - tx1)
-        tbl_h = max(1, ty2 - ty1)
+        # Single OCR call on the full page (not on per-cell crops)
+        page_words = _ocr_page_words(img, ocr_model)
 
-        # Build cell grid from divider positions.
-        # table_rows / table_cols are normalised positions *within* the table box.
-        def _row_boundaries():
-            ys = sorted({0.0} | {r for r in table_rows if 0.0 < r < 1.0} | {1.0})
-            return list(zip(ys[:-1], ys[1:]))
+        # Build cell-grid boundaries from separator positions
+        tbl_x1 = bbox_norm.get("x1", 0.0)
+        tbl_y1 = bbox_norm.get("y1", 0.0)
+        tbl_x2 = bbox_norm.get("x2", 1.0)
+        tbl_y2 = bbox_norm.get("y2", 1.0)
 
-        def _col_boundaries():
-            xs = sorted({0.0} | {c for c in table_cols if 0.0 < c < 1.0} | {1.0})
-            return list(zip(xs[:-1], xs[1:]))
+        row_seps = sorted(r for r in table_rows if tbl_y1 < r < tbl_y2)
+        col_seps = sorted(c for c in table_cols if tbl_x1 < c < tbl_x2)
 
-        row_bounds = _row_boundaries()
-        col_bounds = _col_boundaries()
+        row_bounds = list(zip([tbl_y1] + row_seps, row_seps + [tbl_y2]))
+        col_bounds = list(zip([tbl_x1] + col_seps, col_seps + [tbl_x2]))
 
         if not row_bounds or not col_bounds:
             return jsonify({"error": "No valid row/col dividers provided"}), 400
 
-        # Pre-parse existing HTML to preserve header (th) tags
-        existing_header_flags: dict[tuple, bool] = {}
-        try:
-            import html.parser as _hp
+        # Preserve header (th) designations from existing HTML
+        header_row_indices: set = set()
+        if existing_html:
+            try:
+                tbl_elem = ET.fromstring(existing_html)
+                for ri, tr in enumerate(tbl_elem.findall("tr")):
+                    if any(cell.tag == "th" for cell in tr):
+                        header_row_indices.add(ri)
+            except Exception:
+                pass
 
-            class _HeaderParser(_hp.HTMLParser):
-                def __init__(self):
-                    super().__init__()
-                    self._row = -1
-                    self._col = -1
-                    self._in_cell = False
-                    self._is_header = False
-                    self.flags: dict[tuple, bool] = {}
+        def _esc(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-                def handle_starttag(self, tag, attrs):
-                    if tag == "tr":
-                        self._row += 1
-                        self._col = -1
-                    elif tag in ("td", "th"):
-                        self._col += 1
-                        self._in_cell = True
-                        self._is_header = (tag == "th")
-
-                def handle_endtag(self, tag):
-                    if tag in ("td", "th"):
-                        self.flags[(self._row, self._col)] = self._is_header
-                        self._in_cell = False
-
-            p = _HeaderParser()
-            p.feed(existing_html)
-            existing_header_flags = p.flags
-        except Exception:
-            pass
-
-        # Prepare OCR engine once for all cells
-        if ocr_model == "easyocr":
-            easy_reader = _get_easyocr_reader()
-            _google_ocr_inst = None
-        else:
-            easy_reader = None
-            _google_ocr_inst = _get_google_ocr()
-
-        # Build new HTML table
+        # Assign words to each cell using spatial matching
         rows_html = []
-        for ri, (r0, r1) in enumerate(row_bounds):
+        for ri, (ry1, ry2) in enumerate(row_bounds):
             cells_html = []
-            for ci, (c0, c1) in enumerate(col_bounds):
-                # Cell pixel coords (absolute in page image)
-                cx1 = tx1 + int(c0 * tbl_w)
-                cy1 = ty1 + int(r0 * tbl_h)
-                cx2 = tx1 + int(c1 * tbl_w)
-                cy2 = ty1 + int(r1 * tbl_h)
-                cell_text = ""
-                if cx2 - cx1 >= 4 and cy2 - cy1 >= 4:
-                    cropped = img.crop((cx1, cy1, cx2, cy2))
-                    try:
-                        if ocr_model == "easyocr":
-                            img_arr = np.array(cropped)
-                            result = easy_reader.readtext(img_arr)
-                            cell_text = _easyocr_text_from_result(result)
-                        else:
-                            cell_text = _ocr_crop_pil(cropped, "google", _google_ocr_inst)
-                    except Exception:
-                        pass
-                is_header = existing_header_flags.get((ri, ci), False)
+            for ci, (cx1, cx2) in enumerate(col_bounds):
+                cell_bbox = {"x1": cx1, "y1": ry1, "x2": cx2, "y2": ry2}
+                cell_text = _assign_words_to_bbox(page_words, cell_bbox)
+                is_header = ri in header_row_indices
                 tag = "th" if is_header else "td"
-                safe_text = (
-                    cell_text
-                    .replace("&", "&amp;")
-                    .replace("<", "&lt;")
-                    .replace(">", "&gt;")
-                )
-                cells_html.append(f"<{tag}>{safe_text}</{tag}>")
+                cells_html.append(f"<{tag}>{_esc(cell_text)}</{tag}>")
             rows_html.append("<tr>" + "".join(cells_html) + "</tr>")
 
         new_html = "<table>" + "".join(rows_html) + "</table>"
@@ -1298,6 +1321,148 @@ def ocr_table_cells():
 
     except Exception as e:
         return jsonify({"error": f"OCR table cells failed: {e}"}), 500
+
+
+@app.route("/rematch_ocr", methods=["POST"])
+def rematch_ocr():
+    """OCR the full page once and re-assign text to all layout elements.
+
+    Performs a single full-page OCR call, then distributes detected words to
+    every element on the page by spatial matching (word centroid inside element
+    bbox).  For table elements that have ``table_rows`` / ``table_cols``
+    separators defined, words are further assigned to individual cells so that
+    ``table_html`` is rebuilt with accurate per-cell text.
+
+    This endpoint is designed for the "Rematch OCR" button so the user can
+    quickly re-assign text after editing bounding boxes or table structure.
+
+    Accepts JSON::
+
+        {
+            "image_filename": str,
+            "elements": [
+                {
+                    "id": str,
+                    "label": str,
+                    "bbox_norm": {x1, y1, x2, y2},
+                    "table_rows": [...],   // for table elements
+                    "table_cols": [...],   // for table elements
+                    "table_html": str,     // for table elements (preserves header tags)
+                },
+                ...
+            ],
+            "ocr_model": "google" | "easyocr"
+        }
+
+    Returns::
+
+        {
+            "elements": [{"id": str, "content": str, "table_html": str}, ...],
+            "ocr_used": str
+        }
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    image_filename = data.get("image_filename", "")
+    elements = data.get("elements", [])
+    ocr_model = data.get("ocr_model", "google")
+
+    if not image_filename:
+        return jsonify({"error": "image_filename is required"}), 400
+
+    img_path = os.path.join(UPLOAD_FOLDER, secure_filename(Path(image_filename).name))
+    if not os.path.exists(img_path):
+        return jsonify({"error": f"Image not found: {image_filename}"}), 404
+
+    try:
+        img = Image.open(img_path)
+        # Single OCR call for the full page
+        page_words = _ocr_page_words(img, ocr_model)
+
+        skip_labels = {"picture"}
+        updated = []
+
+        def _esc(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        for el in elements:
+            el_id = el.get("id", "")
+            label = el.get("label", "")
+            bbox_norm = el.get("bbox_norm", {})
+
+            if label in skip_labels or not bbox_norm:
+                updated.append({"id": el_id})
+                continue
+
+            # Assign words to element bbox for the top-level content field
+            content = _assign_words_to_bbox(page_words, bbox_norm)
+            result: dict = {"id": el_id, "content": content}
+
+            # For table elements: also distribute words to individual cells
+            if label == "table":
+                table_rows = el.get("table_rows") or []
+                table_cols = el.get("table_cols") or []
+                existing_html = el.get("table_html", "")
+
+                tbl_x1 = bbox_norm.get("x1", 0.0)
+                tbl_y1 = bbox_norm.get("y1", 0.0)
+                tbl_x2 = bbox_norm.get("x2", 1.0)
+                tbl_y2 = bbox_norm.get("y2", 1.0)
+
+                row_seps = sorted(r for r in table_rows if tbl_y1 < r < tbl_y2)
+                col_seps = sorted(c for c in table_cols if tbl_x1 < c < tbl_x2)
+                row_bounds = list(zip([tbl_y1] + row_seps, row_seps + [tbl_y2]))
+                col_bounds = list(zip([tbl_x1] + col_seps, col_seps + [tbl_x2]))
+
+                if row_bounds and col_bounds:
+                    # Preserve header (th) tags from existing HTML
+                    header_row_indices: set = set()
+                    if existing_html:
+                        try:
+                            tbl_elem = ET.fromstring(existing_html)
+                            for ri, tr in enumerate(tbl_elem.findall("tr")):
+                                if any(c.tag == "th" for c in tr):
+                                    header_row_indices.add(ri)
+                        except Exception:
+                            pass
+
+                    rows_html = []
+                    content_rows = []
+                    for ri, (ry1, ry2) in enumerate(row_bounds):
+                        cells_html = []
+                        content_cells = []
+                        for ci, (cx1, cx2) in enumerate(col_bounds):
+                            cell_bbox = {"x1": cx1, "y1": ry1, "x2": cx2, "y2": ry2}
+                            cell_text = _assign_words_to_bbox(page_words, cell_bbox)
+                            is_header = ri in header_row_indices
+                            tag = "th" if is_header else "td"
+                            cells_html.append(f"<{tag}>{_esc(cell_text)}</{tag}>")
+                            content_cells.append(cell_text)
+                        rows_html.append("<tr>" + "".join(cells_html) + "</tr>")
+                        content_rows.append(" | ".join(content_cells))
+
+                    result["table_html"] = "<table>" + "".join(rows_html) + "</table>"
+                    result["content"] = "\n".join(
+                        " | ".join(cells)
+                        for cells in (
+                            [_assign_words_to_bbox(page_words, {"x1": cx1, "y1": ry1, "x2": cx2, "y2": ry2})
+                             for ci, (cx1, cx2) in enumerate(col_bounds)]
+                            for ri, (ry1, ry2) in enumerate(row_bounds)
+                        )
+                        if any(c.strip() for c in cells)
+                    )
+
+            updated.append(result)
+
+        return jsonify({
+            "elements": updated,
+            "ocr_used": _OCR_LABELS.get(ocr_model, ocr_model),
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Rematch OCR failed: {e}"}), 500
 
 
 # ---------------------------------------------------------------------------
