@@ -11,16 +11,21 @@ Options:
     --no-docling  Skip docling processing (show empty annotations)
 """
 
+import io
 import json
 import os
 import re
 import shutil
+import sqlite3
+import threading
 import uuid
 import argparse
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from xml.dom import minidom
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory
+import numpy as np
 from PIL import Image
 from werkzeug.utils import secure_filename
 from google_ocr import GoogleOCR
@@ -35,10 +40,80 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "labeler_data", "uploads")
 ANNOTATIONS_FOLDER = os.path.join(BASE_DIR, "labeler_data", "annotations")
 XML_ANNOTATIONS_FOLDER = os.path.join(BASE_DIR, "labeler_data", "xml_annotations")
+DB_PATH = os.path.join(BASE_DIR, "labeler_data", "annotations.db")
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(ANNOTATIONS_FOLDER, exist_ok=True)
 os.makedirs(XML_ANNOTATIONS_FOLDER, exist_ok=True)
+
+# Human-readable labels for the OCR engine used in toast/response messages
+_OCR_LABELS: dict[str, str] = {
+    "google": "Google Vision OCR",
+    "easyocr": "EasyOCR",
+}
+
+# ---------------------------------------------------------------------------
+# SQLite database helpers (multi-user annotation storage)
+# ---------------------------------------------------------------------------
+
+_db_write_lock = threading.Lock()
+
+
+def _get_db() -> sqlite3.Connection:
+    """Return a new SQLite connection (caller must close it).
+
+    WAL journal mode is enabled so concurrent reads don't block writers.
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _init_db() -> None:
+    """Create database tables if they don't already exist."""
+    with _get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS annotation_sessions (
+                session_id   TEXT PRIMARY KEY,
+                document_name TEXT NOT NULL,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS page_annotations (
+                session_id   TEXT NOT NULL,
+                page_num     INTEGER NOT NULL,
+                image_name   TEXT NOT NULL,
+                width        REAL NOT NULL DEFAULT 0,
+                height       REAL NOT NULL DEFAULT 0,
+                elements_json TEXT NOT NULL DEFAULT '[]',
+                updated_at   TEXT NOT NULL,
+                PRIMARY KEY (session_id, page_num),
+                FOREIGN KEY (session_id)
+                    REFERENCES annotation_sessions(session_id)
+                    ON DELETE CASCADE
+            );
+        """)
+
+
+_init_db()
+
+# ---------------------------------------------------------------------------
+# Google OCR module-level instance cache (loading the OCR object is lightweight
+# but caching avoids repeatedly reading the env-var on every request).
+# ---------------------------------------------------------------------------
+
+_google_ocr_cache: GoogleOCR | None = None
+
+
+def _get_google_ocr() -> GoogleOCR:
+    """Return a cached GoogleOCR instance."""
+    global _google_ocr_cache
+    if _google_ocr_cache is None:
+        api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
+        _google_ocr_cache = GoogleOCR(api_key=api_key)
+    return _google_ocr_cache
 
 # All supported docling tag types with display colors
 DOCLING_TAGS = [
@@ -317,21 +392,23 @@ def process_with_docling(pdf_path):
 
 def apply_google_ocr_to_elements(elements_by_page, image_paths):
     """
-    Replace each element's text content with Google Vision OCR output.
-    Crops the element's bounding box from the page image and OCRs the region.
-    Requires the GOOGLE_OCR_API_KEY environment variable to be set.
-    Labels that typically contain no text (e.g. 'picture') are skipped.
+    Replace each element's text content using full-page Google Vision OCR.
+
+    OCRs each page image once, then assigns text to elements by matching
+    word-level bounding boxes returned by the Vision API to each element's
+    bbox.  This is significantly faster than the previous per-element crop
+    approach and more accurate because the full-page context is preserved.
     """
-    api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
-    ocr = GoogleOCR(api_key=api_key)
-    skip_labels = {"picture", "table"}
+    skip_labels = {"picture"}
 
     for page_no, img_path in enumerate(image_paths, 1):
         page_elements = elements_by_page.get(page_no, [])
         if not page_elements:
             continue
         img = Image.open(img_path)
-        img_w, img_h = img.size
+        page_words = _ocr_page_words(img, "google")
+        if not page_words:
+            continue
 
         for el in page_elements:
             if el.get("label") in skip_labels:
@@ -339,81 +416,205 @@ def apply_google_ocr_to_elements(elements_by_page, image_paths):
             bbox = el.get("bbox_norm")
             if not bbox:
                 continue
-            x1 = int(bbox["x1"] * img_w)
-            y1 = int(bbox["y1"] * img_h)
-            x2 = int(bbox["x2"] * img_w)
-            y2 = int(bbox["y2"] * img_h)
-            if x2 - x1 < 4 or y2 - y1 < 4:
-                continue
-            cropped = img.crop((x1, y1, x2, y2))
-            tmp_path = os.path.join(UPLOAD_FOLDER, f"_crop_{uuid.uuid4().hex}.png")
-            cropped.save(tmp_path, "PNG")
-            try:
-                text = ocr.google_vision_ocr(tmp_path)
-                if text.strip():
-                    el["content"] = text.strip()
-            except Exception:
-                pass
-            finally:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+            text = _assign_words_to_bbox(page_words, bbox)
+            if text.strip():
+                el["content"] = text.strip()
 
     return elements_by_page
 
 
-def apply_rapidocr_to_elements(elements_by_page, image_paths):
+def apply_easyocr_to_elements(elements_by_page, image_paths):
     """
-    Replace each element's text content using RapidOCR (docling's built-in OCR engine).
-    Crops each element's bounding box from the page image and OCRs the region.
-    Labels that typically contain no text (e.g. 'picture') are skipped.
+    Replace each element's text content using full-page EasyOCR.
+
+    OCRs each page once via ``easyocr.Reader.readtext`` on the full page
+    image (matching the approach in ``compare_ocr_models.py``), then assigns
+    text to elements by spatial matching.  Running on the full page gives
+    EasyOCR the character-level context it needs and is far more efficient than
+    per-element cropping.
     """
+    skip_labels = {"picture"}
+
+    for page_no, img_path in enumerate(image_paths, 1):
+        page_elements = elements_by_page.get(page_no, [])
+        if not page_elements:
+            continue
+        img = Image.open(img_path)
+        page_words = _ocr_page_words(img, "easyocr")
+        if not page_words:
+            continue
+
+        for el in page_elements:
+            if el.get("label") in skip_labels:
+                continue
+            bbox = el.get("bbox_norm")
+            if not bbox:
+                continue
+            text = _assign_words_to_bbox(page_words, bbox)
+            if text:
+                el["content"] = text
+
+    return elements_by_page
+
+
+# ---------------------------------------------------------------------------
+# Shared OCR helpers used by the route handlers below
+# ---------------------------------------------------------------------------
+
+# Module-level EasyOCR reader cache (loading the model is expensive)
+_easyocr_reader_cache = None
+
+
+def _get_easyocr_reader(langs=None):
+    """Return a cached EasyOCR Reader instance (raises ImportError if not installed).
+
+    ``gpu=False`` is forced so the reader works on CPU-only machines without
+    CUDA errors; this matches the usage pattern in compare_ocr_models.py.
+    """
+    global _easyocr_reader_cache
+    if _easyocr_reader_cache is not None:
+        return _easyocr_reader_cache
     try:
-        from rapidocr_onnxruntime import RapidOCR
+        import easyocr  # type: ignore[import-untyped]
     except ImportError:
-        try:
-            from rapidocr_openvino import RapidOCR
-        except ImportError:
-            raise ImportError(
-                "RapidOCR is not installed. Run: pip install rapidocr-onnxruntime"
-            )
+        raise ImportError(
+            "EasyOCR is not installed. Run: pip install easyocr"
+        )
+    _easyocr_reader_cache = easyocr.Reader(langs or ["en"], gpu=False, verbose=False)
+    return _easyocr_reader_cache
 
-    import numpy as np
 
-    engine = RapidOCR()
-    skip_labels = {"picture", "table"}
+def _easyocr_text_from_result(result) -> str:
+    """Extract a plain text string from an EasyOCR result list.
 
-    for page_no, img_path in enumerate(image_paths, 1):
-        page_elements = elements_by_page.get(page_no, [])
-        if not page_elements:
+    Each detected region is a tuple ``(bbox, text, confidence)``.  Lines are
+    joined with a space so the output matches single-line text regions.
+    """
+    if not result:
+        return ""
+    lines = [r[1] for r in result if r and len(r) > 1 and r[1]]
+    return " ".join(lines).strip()
+
+
+def _ocr_page_words(pil_img: Image.Image, ocr_model: str) -> list:
+    """OCR a full page image and return word-level bounding boxes.
+
+    Performs a single OCR call on the complete page – much faster and more
+    accurate than calling OCR on many small per-element crops, especially for
+    EasyOCR which benefits from having full context.
+
+    Returns a list of dicts::
+
+        {"text": str, "x1": float, "y1": float, "x2": float, "y2": float}
+
+    All coordinates are normalised to ``[0, 1]`` relative to the image size.
+    """
+    img_w, img_h = pil_img.size
+    if img_w == 0 or img_h == 0:
+        return []
+
+    if ocr_model == "easyocr":
+        reader = _get_easyocr_reader()
+        img_array = np.array(pil_img)
+        results = reader.readtext(img_array)
+        words = []
+        for (bbox_pts, text, _conf) in results:
+            if not text.strip():
+                continue
+            # bbox_pts: [[tl_x, tl_y], [tr_x, tr_y], [br_x, br_y], [bl_x, bl_y]]
+            xs = [pt[0] for pt in bbox_pts]
+            ys = [pt[1] for pt in bbox_pts]
+            words.append({
+                "text": text.strip(),
+                "x1": max(0.0, min(1.0, min(xs) / img_w)),
+                "y1": max(0.0, min(1.0, min(ys) / img_h)),
+                "x2": max(0.0, min(1.0, max(xs) / img_w)),
+                "y2": max(0.0, min(1.0, max(ys) / img_h)),
+            })
+        return words
+
+    # Google Vision OCR
+    google_ocr = _get_google_ocr()
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    word_data = google_ocr.google_vision_ocr_words_bytes(buf.getvalue())
+    words = []
+    for w in word_data:
+        if not w.get("text", "").strip():
             continue
-        img = Image.open(img_path)
-        img_w, img_h = img.size
+        verts = w.get("vertices", [])
+        if len(verts) < 4:
+            continue
+        xs = [v[0] for v in verts]
+        ys = [v[1] for v in verts]
+        words.append({
+            "text": w["text"],
+            "x1": max(0.0, min(1.0, min(xs) / img_w)),
+            "y1": max(0.0, min(1.0, min(ys) / img_h)),
+            "x2": max(0.0, min(1.0, max(xs) / img_w)),
+            "y2": max(0.0, min(1.0, max(ys) / img_h)),
+        })
+    return words
 
-        for el in page_elements:
-            if el.get("label") in skip_labels:
-                continue
-            bbox = el.get("bbox_norm")
-            if not bbox:
-                continue
-            x1 = int(bbox["x1"] * img_w)
-            y1 = int(bbox["y1"] * img_h)
-            x2 = int(bbox["x2"] * img_w)
-            y2 = int(bbox["y2"] * img_h)
-            if x2 - x1 < 4 or y2 - y1 < 4:
-                continue
-            cropped = img.crop((x1, y1, x2, y2))
-            img_array = np.array(cropped)
-            try:
-                result, _ = engine(img_array)
-                if result:
-                    lines = [r[1] for r in result if r and len(r) > 1 and r[1]]
-                    text = "\n".join(lines)
-                    if text.strip():
-                        el["content"] = text.strip()
-            except Exception:
-                pass
 
-    return elements_by_page
+def _assign_words_to_bbox(words: list, bbox: dict) -> str:
+    """Find OCR words whose centroid falls within *bbox* and return joined text.
+
+    Words are sorted top-to-bottom then left-to-right before joining, so the
+    output preserves natural reading order within the bounding box.
+
+    Parameters
+    ----------
+    words:
+        Output of :func:`_ocr_page_words` – list of
+        ``{"text", "x1", "y1", "x2", "y2"}`` dicts with normalised coords.
+    bbox:
+        Normalised bounding box ``{"x1", "y1", "x2", "y2"}``.
+    """
+    x1, y1, x2, y2 = bbox.get("x1", 0), bbox.get("y1", 0), bbox.get("x2", 1), bbox.get("y2", 1)
+    matched = sorted(
+        (
+            w for w in words
+            if x1 <= (w["x1"] + w["x2"]) / 2 <= x2
+            and y1 <= (w["y1"] + w["y2"]) / 2 <= y2
+        ),
+        key=lambda w: (w["y1"], w["x1"]),
+    )
+    return " ".join(w["text"] for w in matched)
+
+
+def _ocr_crop_pil(
+    cropped_pil,
+    ocr_model: str,
+    google_ocr: "GoogleOCR | None" = None,
+) -> str:
+    """Run OCR on a PIL Image crop and return the extracted text string.
+
+    Parameters
+    ----------
+    cropped_pil:
+        A :class:`PIL.Image.Image` crop of the region to recognise.
+    ocr_model:
+        ``"google"`` for Google Vision OCR, ``"easyocr"`` for EasyOCR.
+    google_ocr:
+        An already-constructed :class:`GoogleOCR` instance (used when
+        *ocr_model* is ``"google"``).  If *None* the module-level cached
+        instance is used.  Image data is encoded in-memory — no temp file
+        is written to disk.
+    """
+    if ocr_model == "easyocr":
+        reader = _get_easyocr_reader()
+        img_array = np.array(cropped_pil)
+        result = reader.readtext(img_array)
+        return _easyocr_text_from_result(result)
+
+    # Google Vision OCR – encode directly in memory (no temp file I/O)
+    if google_ocr is None:
+        google_ocr = _get_google_ocr()
+    buf = io.BytesIO()
+    cropped_pil.save(buf, format="PNG")
+    return google_ocr.google_vision_ocr_bytes(buf.getvalue()).strip()
+
 
 @app.route("/")
 def index():
@@ -464,11 +665,11 @@ def process_pdf():
             elements_by_page = apply_google_ocr_to_elements(elements_by_page, image_paths)
         except Exception as e:
             ocr_error = f"Google OCR failed: {e}"
-    elif ocr_model == "rapidocr":
+    elif ocr_model == "easyocr":
         try:
-            elements_by_page = apply_rapidocr_to_elements(elements_by_page, image_paths)
+            elements_by_page = apply_easyocr_to_elements(elements_by_page, image_paths)
         except Exception as e:
-            ocr_error = f"RapidOCR failed: {e}"
+            ocr_error = f"EasyOCR failed: {e}"
 
     # Build response
     pages = []
@@ -491,6 +692,8 @@ def process_pdf():
         resp["docling_warning"] = f"Docling processing failed: {docling_error}"
     if ocr_error:
         resp["ocr_warning"] = ocr_error
+    if ocr_model != "none":
+        resp["ocr_used"] = _OCR_LABELS.get(ocr_model, ocr_model)
 
     return jsonify(resp)
 
@@ -560,11 +763,8 @@ def save_annotations():
 
 @app.route("/list_annotations")
 def list_annotations():
-    files = []
-    for fn in os.listdir(ANNOTATIONS_FOLDER):
-        if fn.endswith("_annotations.json"):
-            files.append(fn)
-    return jsonify({"files": sorted(files)})
+    files = sorted(p.name for p in Path(ANNOTATIONS_FOLDER).glob("*_annotations.json"))
+    return jsonify({"files": files})
 
 
 @app.route("/load_annotations/<filename>")
@@ -577,12 +777,202 @@ def load_annotations(filename):
         return jsonify(json.load(f))
 
 
+# ---------------------------------------------------------------------------
+# Database-backed annotation routes (multi-user safe)
+# ---------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@app.route("/db/save_annotations", methods=["POST"])
+def db_save_annotations():
+    """Save annotations to the SQLite database.
+
+    Accepts the same JSON payload as ``/save_annotations`` plus an optional
+    ``session_id`` field.  If ``session_id`` is omitted a new UUID is created.
+    This allows multiple users to save annotations for the same document
+    without overwriting each other's work.
+
+    Returns ``{ session_id, num_pages, num_elements }``.
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    pages_data = data.get("pages", {})
+    session_id = data.get("session_id") or str(uuid.uuid4())
+    document_name = data.get("document_name", "unknown")
+    now = _now_iso()
+    total_elements = 0
+
+    with _db_write_lock:
+        with _get_db() as conn:
+            # Upsert session record
+            conn.execute(
+                """
+                INSERT INTO annotation_sessions (session_id, document_name, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    document_name = excluded.document_name,
+                    updated_at    = excluded.updated_at
+                """,
+                (session_id, document_name, now, now),
+            )
+
+            for p, page_info in sorted(pages_data.items(), key=lambda x: int(x[0])):
+                if isinstance(page_info, list):
+                    elements = page_info
+                    image_name = f"page_{p}"
+                    width, height = 0, 0
+                else:
+                    elements = page_info.get("elements", [])
+                    image_name = page_info.get("image_name", f"page_{p}")
+                    width = page_info.get("width", 0)
+                    height = page_info.get("height", 0)
+
+                safe_image_name = (
+                    secure_filename(re.sub(r"[^\w\-.]", "_", image_name)) or f"page_{p}"
+                )
+                total_elements += len(elements)
+
+                conn.execute(
+                    """
+                    INSERT INTO page_annotations
+                        (session_id, page_num, image_name, width, height, elements_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id, page_num) DO UPDATE SET
+                        image_name    = excluded.image_name,
+                        width         = excluded.width,
+                        height        = excluded.height,
+                        elements_json = excluded.elements_json,
+                        updated_at    = excluded.updated_at
+                    """,
+                    (
+                        session_id,
+                        int(p),
+                        safe_image_name,
+                        width,
+                        height,
+                        json.dumps(elements, ensure_ascii=False),
+                        now,
+                    ),
+                )
+
+    return jsonify({
+        "session_id": session_id,
+        "document_name": document_name,
+        "num_pages": len(pages_data),
+        "num_elements": total_elements,
+    })
+
+
+@app.route("/db/list_sessions")
+def db_list_sessions():
+    """Return all annotation sessions with metadata.
+
+    Optional query parameters:
+      - ``document_name``: filter by document name (substring match)
+    """
+    doc_filter = request.args.get("document_name", "")
+    with _get_db() as conn:
+        if doc_filter:
+            rows = conn.execute(
+                """
+                SELECT s.session_id, s.document_name, s.created_at, s.updated_at,
+                       COUNT(p.page_num) AS num_pages,
+                       SUM(LENGTH(p.elements_json) - LENGTH(REPLACE(p.elements_json, '"id"', '')))
+                           AS approx_elements
+                FROM annotation_sessions s
+                LEFT JOIN page_annotations p USING (session_id)
+                WHERE s.document_name LIKE ?
+                GROUP BY s.session_id
+                ORDER BY s.updated_at DESC
+                """,
+                (f"%{doc_filter}%",),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT s.session_id, s.document_name, s.created_at, s.updated_at,
+                       COUNT(p.page_num) AS num_pages,
+                       SUM(LENGTH(p.elements_json) - LENGTH(REPLACE(p.elements_json, '"id"', '')))
+                           AS approx_elements
+                FROM annotation_sessions s
+                LEFT JOIN page_annotations p USING (session_id)
+                GROUP BY s.session_id
+                ORDER BY s.updated_at DESC
+                """
+            ).fetchall()
+
+    sessions = [dict(r) for r in rows]
+    return jsonify({"sessions": sessions})
+
+
+@app.route("/db/load_annotations/<session_id>")
+def db_load_annotations(session_id):
+    """Return all page annotations for a given session.
+
+    Returns ``{ session_id, document_name, pages: [ {page_num, image_name, width, height, elements} ] }``.
+    """
+    with _get_db() as conn:
+        sess = conn.execute(
+            "SELECT * FROM annotation_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if sess is None:
+            return jsonify({"error": "Session not found"}), 404
+
+        page_rows = conn.execute(
+            """
+            SELECT page_num, image_name, width, height, elements_json
+            FROM page_annotations
+            WHERE session_id = ?
+            ORDER BY page_num
+            """,
+            (session_id,),
+        ).fetchall()
+
+    pages = [
+        {
+            "page_num": r["page_num"],
+            "image_name": r["image_name"],
+            "width": r["width"],
+            "height": r["height"],
+            "elements": json.loads(r["elements_json"]),
+        }
+        for r in page_rows
+    ]
+    return jsonify({
+        "session_id": sess["session_id"],
+        "document_name": sess["document_name"],
+        "created_at": sess["created_at"],
+        "updated_at": sess["updated_at"],
+        "pages": pages,
+    })
+
+
+@app.route("/db/delete_session/<session_id>", methods=["DELETE"])
+def db_delete_session(session_id):
+    """Permanently delete an annotation session and all its page data."""
+    with _db_write_lock:
+        with _get_db() as conn:
+            result = conn.execute(
+                "DELETE FROM annotation_sessions WHERE session_id = ?",
+                (session_id,),
+            )
+    if result.rowcount == 0:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify({"success": True, "deleted_session_id": session_id})
+
+
 @app.route("/ocr_region", methods=["POST"])
 def ocr_region():
     """
-    Run Google OCR on a specific bounding box region of a page image.
-    Expects JSON: { image_filename: str, bbox_norm: {x1, y1, x2, y2} }
-    Returns: { text: str }
+    Run OCR on a specific bounding box region of a page image.
+    Expects JSON: { image_filename: str, bbox_norm: {x1, y1, x2, y2},
+                    ocr_model: "google" | "easyocr"  (optional, default "google") }
+    Returns: { text: str, ocr_used: str }
     """
     data = request.json
     if not data:
@@ -590,6 +980,7 @@ def ocr_region():
 
     image_filename = data.get("image_filename", "")
     bbox_norm = data.get("bbox_norm", {})
+    ocr_model = data.get("ocr_model", "google")
 
     if not image_filename:
         return jsonify({"error": "image_filename is required"}), 400
@@ -609,17 +1000,8 @@ def ocr_region():
             return jsonify({"error": "Bounding box too small"}), 400
 
         cropped = img.crop((x1, y1, x2, y2))
-        tmp_path = os.path.join(UPLOAD_FOLDER, f"_ocr_{uuid.uuid4().hex}.png")
-        cropped.save(tmp_path, "PNG")
-        try:
-            api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
-            ocr = GoogleOCR(api_key=api_key)
-            text = ocr.google_vision_ocr(tmp_path)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-        return jsonify({"text": text.strip()})
+        text = _ocr_crop_pil(cropped, ocr_model)
+        return jsonify({"text": text, "ocr_used": _OCR_LABELS.get(ocr_model, ocr_model)})
     except Exception as e:
         return jsonify({"error": f"OCR failed: {e}"}), 500
 
@@ -716,7 +1098,8 @@ def export_xml():
 def redetect_tables():
     """
     Re-detect tables on a single page using the CV-based TableDetector
-    (table_detection.py) and populate cell text with Google OCR.
+    (table_detection.py) and populate cell text with the selected OCR engine.
+    Accepts optional field ``ocr_model``: ``"google"`` (default) or ``"easyocr"``.
     Returns table elements in the same format as /process.
     """
     data = request.json
@@ -725,6 +1108,7 @@ def redetect_tables():
 
     pdf_filename = data.get("pdf_filename", "")
     page_no = int(data.get("page_no", 1))
+    ocr_model = data.get("ocr_model", "google")
 
     if not pdf_filename:
         return jsonify({"error": "pdf_filename is required"}), 400
@@ -748,9 +1132,13 @@ def redetect_tables():
         detector = TableDetector()
         detections = detector.detect(cv_img, page_no)
 
-        # OCR each cell using Google Vision
-        api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
-        ocr = GoogleOCR(api_key=api_key)
+        # Prepare OCR engine once for all cells
+        if ocr_model == "easyocr":
+            easy_reader = _get_easyocr_reader()
+            _google_ocr_inst = None
+        else:
+            easy_reader = None
+            _google_ocr_inst = _get_google_ocr()
 
         for det in detections:
             for cell in det.cells:
@@ -761,17 +1149,17 @@ def redetect_tables():
                 if x2 - x1 < 4 or y2 - y1 < 4:
                     continue
                 cropped = pil_img.crop((x1, y1, x2, y2))
-                tmp_path = os.path.join(UPLOAD_FOLDER, f"_cell_{uuid.uuid4().hex}.png")
-                cropped.save(tmp_path, "PNG")
                 try:
-                    text = ocr.google_vision_ocr(tmp_path)
-                    if text.strip():
-                        cell.text = text.strip()
+                    if ocr_model == "easyocr":
+                        img_array = np.array(cropped)
+                        result = easy_reader.readtext(img_array)
+                        text = _easyocr_text_from_result(result)
+                    else:
+                        text = _ocr_crop_pil(cropped, "google", _google_ocr_inst)
+                    if text:
+                        cell.text = text
                 except Exception:
                     pass
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
 
             # Rebuild HTML with OCR text
             num_rows = max((c.row for c in det.cells), default=0) + 1
@@ -830,326 +1218,38 @@ def redetect_tables():
             "tables": table_elements,
             "all_elements": table_elements,
             "page_no": page_no,
+            "ocr_used": _OCR_LABELS.get(ocr_model, ocr_model),
         })
 
     except Exception as e:
         return jsonify({"error": f"Re-detection failed: {e}"}), 500
 
 
-# ---------------------------------------------------------------------------
-# COCO-table helper
-# ---------------------------------------------------------------------------
-
-
-def process_image_with_docling(img_path):
-    """Run docling on a single image file and return non-table elements
-    with normalised (0–1) bounding boxes.
-
-    This is used by /import_folder when ``run_docling=True`` so that text,
-    titles, headers and other non-table elements are included alongside the
-    COCO-derived table elements.
-
-    Returns a list of element dicts (same schema as /process elements), or
-    an empty list when docling is not installed or processing fails.
-    """
-    try:
-        from docling.document_converter import DocumentConverter
-        from docling.datamodel.base_models import InputFormat
-    except ImportError:
-        return []
-
-    try:
-        converter = DocumentConverter(allowed_formats=[InputFormat.IMAGE])
-        result = converter.convert(img_path)
-        doc = result.document
-    except Exception:
-        return []
-
-    # Determine page dimensions (pixels) — docling uses TOPLEFT origin for images
-    page_w, page_h = 0.0, 0.0
-    try:
-        pages_attr = doc.pages
-        if hasattr(pages_attr, "items"):
-            page_items = list(pages_attr.items())
-        elif hasattr(pages_attr, "__iter__"):
-            page_items = list(enumerate(pages_attr, 1))
-        else:
-            page_items = []
-        if page_items:
-            _, first_page = page_items[0]
-            if hasattr(first_page, "size") and first_page.size:
-                page_w = float(getattr(first_page.size, "width", 0))
-                page_h = float(getattr(first_page.size, "height", 0))
-    except Exception:
-        pass
-
-    # Fall back to actual pixel dimensions from the image file
-    if not page_w or not page_h:
-        try:
-            with Image.open(img_path) as pil_img:
-                page_w, page_h = float(pil_img.width), float(pil_img.height)
-        except Exception:
-            return []
-
-    elements = []
-    try:
-        for item, _level in doc.iterate_items():
-            label = item.label.value if hasattr(item.label, "value") else str(item.label)
-            # Skip table elements – they are supplied by the COCO labels
-            if label == "table":
-                continue
-            if not hasattr(item, "prov") or not item.prov:
-                continue
-            prov_list = item.prov if isinstance(item.prov, list) else [item.prov]
-            for prov in prov_list:
-                raw_bbox = getattr(prov, "bbox", None)
-                if raw_bbox is None:
-                    continue
-                bbox_norm = _bbox_to_norm(raw_bbox, page_w, page_h)
-                if bbox_norm is None:
-                    continue
-                elements.append({
-                    "id": str(uuid.uuid4()),
-                    "label": label,
-                    "content": _get_item_text(item),
-                    "bbox_norm": bbox_norm,
-                })
-    except Exception:
-        pass
-
-    return elements
-
-def _coco_to_table_element(annotations):
-    """Convert a list of (class_id, cx, cy, w, h) COCO table-structure annotations
-    to a labeler element dict containing ``table_html``, ``table_rows``, and
-    ``table_cols``.
-
-    Class IDs:
-      0 = table-row
-      1 = table-column
-      2 = table-spanning-cell  (layout only; cells stay empty)
-      3 = table-column-header
-    """
-    rows_raw = []
-    cols_raw = []
-    header_regions = []
-
-    for cls, cx, cy, w, h in annotations:
-        x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
-        if cls == 0:
-            rows_raw.append((x1, y1, x2, y2))
-        elif cls == 1:
-            cols_raw.append((x1, y1, x2, y2))
-        elif cls == 3:
-            header_regions.append((x1, y1, x2, y2))
-
-    if not rows_raw and not header_regions:
-        return None
-    if not cols_raw:
-        return None
-
-    rows_raw.sort(key=lambda b: (b[1] + b[3]) / 2)
-    cols_raw.sort(key=lambda b: (b[0] + b[2]) / 2)
-
-    def _overlaps_y(a, b, threshold=0.3):
-        inter = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
-        shorter = min(a[3] - a[1], b[3] - b[1])
-        return shorter > 0 and inter / shorter >= threshold
-
-    # Merge class-0 rows with class-3 header regions; insert unmatched header regions
-    matched_header_idx: set = set()
-    all_rows = []
-    for row_bbox in rows_raw:
-        is_h = False
-        for i, hr in enumerate(header_regions):
-            if _overlaps_y(row_bbox, hr):
-                is_h = True
-                matched_header_idx.add(i)
-        all_rows.append((*row_bbox, is_h))
-    for i, hr in enumerate(header_regions):
-        if i not in matched_header_idx:
-            all_rows.append((*hr, True))
-
-    all_rows.sort(key=lambda r: (r[1] + r[3]) / 2)
-
-    # Table bounding box
-    all_bboxes = [(r[0], r[1], r[2], r[3]) for r in all_rows] + cols_raw
-    tbl_x1 = max(0.0, min(1.0, min(b[0] for b in all_bboxes)))
-    tbl_y1 = max(0.0, min(1.0, min(b[1] for b in all_bboxes)))
-    tbl_x2 = max(0.0, min(1.0, max(b[2] for b in all_bboxes)))
-    tbl_y2 = max(0.0, min(1.0, max(b[3] for b in all_bboxes)))
-
-    n_cols = len(cols_raw)
-
-    # Build empty-cell HTML
-    html_rows = []
-    for row in all_rows:
-        cells = "".join(f"<{'th' if row[4] else 'td'}></{'th' if row[4] else 'td'}>" for _ in range(n_cols))
-        html_rows.append(f"<tr>{cells}</tr>")
-    table_html = "<table>" + "".join(html_rows) + "</table>"
-
-    # Separator positions (image-normalised coords)
-    table_rows = []
-    for i in range(len(all_rows) - 1):
-        mid_y = (all_rows[i][3] + all_rows[i + 1][1]) / 2
-        table_rows.append(round(max(0.0, min(1.0, mid_y)), 4))
-
-    table_cols = []
-    for i in range(len(cols_raw) - 1):
-        mid_x = (cols_raw[i][2] + cols_raw[i + 1][0]) / 2
-        table_cols.append(round(max(0.0, min(1.0, mid_x)), 4))
-
-    return {
-        "id": str(uuid.uuid4()),
-        "label": "table",
-        "content": "",
-        "bbox_norm": {
-            "x1": round(tbl_x1, 4),
-            "y1": round(tbl_y1, 4),
-            "x2": round(tbl_x2, 4),
-            "y2": round(tbl_y2, 4),
-        },
-        "table_html": table_html,
-        "table_rows": table_rows,
-        "table_cols": table_cols,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Import folder of images + COCO table labels
-# ---------------------------------------------------------------------------
-
-@app.route("/import_folder", methods=["POST"])
-def import_folder():
-    """Import all images from a local folder, matching each to a COCO-format
-    .txt label file (same stem) to build table elements.
-
-    Accepts JSON::
-
-        {
-            "folder_path": "/abs/or/relative/path",
-            "run_docling": false   # optional: also detect non-table elements
-        }
-
-    When ``run_docling`` is ``true``, docling is run on every image to detect
-    text, titles, headers and other non-table elements, which are merged
-    alongside the COCO-derived table elements.
-
-    Returns the same JSON structure as ``/process``.
-    """
-    data = request.json
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
-
-    folder_path = data.get("folder_path", "").strip()
-    if not folder_path:
-        return jsonify({"error": "folder_path is required"}), 400
-
-    run_docling = bool(data.get("run_docling", False))
-
-    # Resolve relative to BASE_DIR
-    folder = (
-        Path(folder_path) if Path(folder_path).is_absolute()
-        else Path(BASE_DIR) / folder_path
-    )
-    if not folder.exists() or not folder.is_dir():
-        return jsonify({"error": f"Folder not found: {folder_path}"}), 400
-
-    image_extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
-    img_files = sorted(
-        p for p in folder.iterdir() if p.suffix.lower() in image_extensions
-    )
-    if not img_files:
-        return jsonify({"error": "No image files found in folder"}), 400
-
-    pages = []
-    docling_warning = None
-    for page_no, img_file in enumerate(img_files, 1):
-        dest_name = secure_filename(img_file.name)
-        dest_path = os.path.join(UPLOAD_FOLDER, dest_name)
-        # Copy only if missing or size differs
-        if not os.path.exists(dest_path) or os.path.getsize(dest_path) != img_file.stat().st_size:
-            shutil.copy2(str(img_file), dest_path)
-
-        try:
-            with Image.open(dest_path) as pil_img:
-                img_w, img_h = pil_img.size
-        except Exception:
-            img_w, img_h = 0, 0
-
-        # Non-table elements from docling (optional)
-        elements = []
-        if run_docling:
-            try:
-                docling_elements = process_image_with_docling(dest_path)
-                elements.extend(docling_elements)
-            except Exception as exc:
-                if docling_warning is None:
-                    docling_warning = f"Docling processing failed: {exc}"
-
-        # Parse optional COCO label file and append table element(s)
-        txt_file = folder / (img_file.stem + ".txt")
-        if txt_file.exists():
-            annotations = []
-            with open(txt_file, encoding="utf-8") as fh:
-                for line in fh:
-                    parts = line.strip().split()
-                    if len(parts) != 5:
-                        continue
-                    try:
-                        cls = int(parts[0])
-                        cx, cy, w, h = (
-                            float(parts[1]), float(parts[2]),
-                            float(parts[3]), float(parts[4]),
-                        )
-                        annotations.append((cls, cx, cy, w, h))
-                    except ValueError:
-                        continue
-            if annotations:
-                el = _coco_to_table_element(annotations)
-                if el:
-                    elements.append(el)
-
-        pages.append({
-            "page_num": page_no,
-            "image_url": f"/page_image/{dest_name}",
-            "width": img_w,
-            "height": img_h,
-            "elements": elements,
-        })
-
-    resp = {
-        "filename": folder.name,
-        "pdf_filename": "",
-        "num_pages": len(pages),
-        "pages": pages,
-    }
-    if docling_warning:
-        resp["docling_warning"] = docling_warning
-    return jsonify(resp)
-
-
-# ---------------------------------------------------------------------------
-# OCR all cells in a table element
-# ---------------------------------------------------------------------------
-
 @app.route("/ocr_table_cells", methods=["POST"])
 def ocr_table_cells():
-    """Run Google OCR on every cell of a table element and return updated HTML.
+    """
+    OCR the full page and distribute text to table cells by spatial location.
 
-    Accepts JSON::
+    Instead of cropping each cell individually (which requires N×M OCR calls),
+    this endpoint OCRs the full page image once and assigns detected words to
+    cells by checking whether each word's centroid falls within the cell's
+    bounding box.  This is faster, more accurate (full-page context), and works
+    much better with EasyOCR.
+
+    Expects JSON::
 
         {
-            "image_filename": "image.jpg",
-            "bbox_norm": {"x1": ..., "y1": ..., "x2": ..., "y2": ...},
-            "table_rows": [y1, y2, ...],   # separator y-positions (normalised)
-            "table_cols": [x1, x2, ...],   # separator x-positions (normalised)
-            "table_html": "<table>...</table>"  # current HTML (preserves header tags)
+            "image_filename": str,
+            "bbox_norm":  { x1, y1, x2, y2 },
+            "table_rows": [ 0.0, 0.3, ... ],   // normalised y separator positions
+            "table_cols": [ 0.0, 0.5, ... ],   // normalised x separator positions
+            "table_html": str,                  // existing HTML (preserves header tags)
+            "ocr_model":  "google" | "easyocr" (optional, default "google")
         }
 
     Returns::
 
-        { "table_html": "<table>...</table>" }
+        { "table_html": str, "ocr_used": str }
     """
     data = request.json
     if not data:
@@ -1157,9 +1257,10 @@ def ocr_table_cells():
 
     image_filename = data.get("image_filename", "")
     bbox_norm = data.get("bbox_norm", {})
-    table_rows_sep = data.get("table_rows", [])
-    table_cols_sep = data.get("table_cols", [])
-    table_html_in = data.get("table_html", "")
+    table_rows = data.get("table_rows", [])
+    table_cols = data.get("table_cols", [])
+    existing_html = data.get("table_html", "")
+    ocr_model = data.get("ocr_model", "google")
 
     if not image_filename:
         return jsonify({"error": "image_filename is required"}), 400
@@ -1170,80 +1271,459 @@ def ocr_table_cells():
 
     try:
         img = Image.open(img_path)
-        img_w, img_h = img.size
 
-        tbl_x1 = bbox_norm.get("x1", 0)
-        tbl_y1 = bbox_norm.get("y1", 0)
-        tbl_x2 = bbox_norm.get("x2", 1)
-        tbl_y2 = bbox_norm.get("y2", 1)
+        # Single OCR call on the full page (not on per-cell crops)
+        page_words = _ocr_page_words(img, ocr_model)
 
-        row_bounds = [tbl_y1] + list(table_rows_sep) + [tbl_y2]
-        col_bounds = [tbl_x1] + list(table_cols_sep) + [tbl_x2]
-        n_rows = len(row_bounds) - 1
-        n_cols = len(col_bounds) - 1
+        # Build cell-grid boundaries from separator positions
+        tbl_x1 = bbox_norm.get("x1", 0.0)
+        tbl_y1 = bbox_norm.get("y1", 0.0)
+        tbl_x2 = bbox_norm.get("x2", 1.0)
+        tbl_y2 = bbox_norm.get("y2", 1.0)
 
-        # Determine which rows are headers from the existing table_html
+        row_seps = sorted(r for r in table_rows if tbl_y1 < r < tbl_y2)
+        col_seps = sorted(c for c in table_cols if tbl_x1 < c < tbl_x2)
+
+        row_bounds = list(zip([tbl_y1] + row_seps, row_seps + [tbl_y2]))
+        col_bounds = list(zip([tbl_x1] + col_seps, col_seps + [tbl_x2]))
+
+        if not row_bounds or not col_bounds:
+            return jsonify({"error": "No valid row/col dividers provided"}), 400
+
+        # Preserve header (th) designations from existing HTML
         header_row_indices: set = set()
-        if table_html_in:
+        if existing_html:
             try:
-                tbl_elem = ET.fromstring(table_html_in)
+                tbl_elem = ET.fromstring(existing_html)
                 for ri, tr in enumerate(tbl_elem.findall("tr")):
                     if any(cell.tag == "th" for cell in tr):
                         header_row_indices.add(ri)
             except Exception:
                 pass
 
-        api_key = os.environ.get("GOOGLE_OCR_API_KEY", "")
-        ocr = GoogleOCR(api_key=api_key)
+        def _esc(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-        grid_texts = [["" for _ in range(n_cols)] for _ in range(n_rows)]
-        for ri in range(n_rows):
-            y1_px = int(row_bounds[ri] * img_h)
-            y2_px = int(row_bounds[ri + 1] * img_h)
-            for ci in range(n_cols):
-                x1_px = int(col_bounds[ci] * img_w)
-                x2_px = int(col_bounds[ci + 1] * img_w)
-                if x2_px - x1_px < 4 or y2_px - y1_px < 4:
-                    continue
-                # Small padding to avoid clipping text at cell edges
-                pad = 2
-                x1c = max(0, x1_px - pad)
-                y1c = max(0, y1_px - pad)
-                x2c = min(img_w, x2_px + pad)
-                y2c = min(img_h, y2_px + pad)
-                cropped = img.crop((x1c, y1c, x2c, y2c))
-                tmp_path = os.path.join(UPLOAD_FOLDER, f"_cell_{uuid.uuid4().hex}.png")
-                cropped.save(tmp_path, "PNG")
-                try:
-                    text = ocr.google_vision_ocr(tmp_path)
-                    grid_texts[ri][ci] = text.strip()
-                except Exception:
-                    pass
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
+        # Assign words to each cell using spatial matching
+        rows_html = []
+        for ri, (ry1, ry2) in enumerate(row_bounds):
+            cells_html = []
+            for ci, (cx1, cx2) in enumerate(col_bounds):
+                cell_bbox = {"x1": cx1, "y1": ry1, "x2": cx2, "y2": ry2}
+                cell_text = _assign_words_to_bbox(page_words, cell_bbox)
+                is_header = ri in header_row_indices
+                tag = "th" if is_header else "td"
+                cells_html.append(f"<{tag}>{_esc(cell_text)}</{tag}>")
+            rows_html.append("<tr>" + "".join(cells_html) + "</tr>")
 
-        # Build updated table HTML, preserving header designation
-        def _esc(s):
-            return (
-                s.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-            )
-
-        html_rows = []
-        for ri in range(n_rows):
-            cells = ""
-            for ci in range(n_cols):
-                tag = "th" if ri in header_row_indices else "td"
-                cells += f"<{tag}>{_esc(grid_texts[ri][ci])}</{tag}>"
-            html_rows.append(f"<tr>{cells}</tr>")
-        new_table_html = "<table>" + "".join(html_rows) + "</table>"
-
-        return jsonify({"table_html": new_table_html})
+        new_html = "<table>" + "".join(rows_html) + "</table>"
+        return jsonify({"table_html": new_html, "ocr_used": _OCR_LABELS.get(ocr_model, ocr_model)})
 
     except Exception as e:
-        return jsonify({"error": f"OCR failed: {e}"}), 500
+        return jsonify({"error": f"OCR table cells failed: {e}"}), 500
+
+
+@app.route("/rematch_ocr", methods=["POST"])
+def rematch_ocr():
+    """OCR the full page once and re-assign text to all layout elements.
+
+    Performs a single full-page OCR call, then distributes detected words to
+    every element on the page by spatial matching (word centroid inside element
+    bbox).  For table elements that have ``table_rows`` / ``table_cols``
+    separators defined, words are further assigned to individual cells so that
+    ``table_html`` is rebuilt with accurate per-cell text.
+
+    This endpoint is designed for the "Rematch OCR" button so the user can
+    quickly re-assign text after editing bounding boxes or table structure.
+
+    Accepts JSON::
+
+        {
+            "image_filename": str,
+            "elements": [
+                {
+                    "id": str,
+                    "label": str,
+                    "bbox_norm": {x1, y1, x2, y2},
+                    "table_rows": [...],   // for table elements
+                    "table_cols": [...],   // for table elements
+                    "table_html": str,     // for table elements (preserves header tags)
+                },
+                ...
+            ],
+            "ocr_model": "google" | "easyocr"
+        }
+
+    Returns::
+
+        {
+            "elements": [{"id": str, "content": str, "table_html": str}, ...],
+            "ocr_used": str
+        }
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    image_filename = data.get("image_filename", "")
+    elements = data.get("elements", [])
+    ocr_model = data.get("ocr_model", "google")
+
+    if not image_filename:
+        return jsonify({"error": "image_filename is required"}), 400
+
+    img_path = os.path.join(UPLOAD_FOLDER, secure_filename(Path(image_filename).name))
+    if not os.path.exists(img_path):
+        return jsonify({"error": f"Image not found: {image_filename}"}), 404
+
+    try:
+        img = Image.open(img_path)
+        # Single OCR call for the full page
+        page_words = _ocr_page_words(img, ocr_model)
+
+        skip_labels = {"picture"}
+        updated = []
+
+        def _esc(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        for el in elements:
+            el_id = el.get("id", "")
+            label = el.get("label", "")
+            bbox_norm = el.get("bbox_norm", {})
+
+            if label in skip_labels or not bbox_norm:
+                updated.append({"id": el_id})
+                continue
+
+            # Assign words to element bbox for the top-level content field
+            content = _assign_words_to_bbox(page_words, bbox_norm)
+            result: dict = {"id": el_id, "content": content}
+
+            # For table elements: also distribute words to individual cells
+            if label == "table":
+                table_rows = el.get("table_rows") or []
+                table_cols = el.get("table_cols") or []
+                existing_html = el.get("table_html", "")
+
+                tbl_x1 = bbox_norm.get("x1", 0.0)
+                tbl_y1 = bbox_norm.get("y1", 0.0)
+                tbl_x2 = bbox_norm.get("x2", 1.0)
+                tbl_y2 = bbox_norm.get("y2", 1.0)
+
+                row_seps = sorted(r for r in table_rows if tbl_y1 < r < tbl_y2)
+                col_seps = sorted(c for c in table_cols if tbl_x1 < c < tbl_x2)
+                row_bounds = list(zip([tbl_y1] + row_seps, row_seps + [tbl_y2]))
+                col_bounds = list(zip([tbl_x1] + col_seps, col_seps + [tbl_x2]))
+
+                if row_bounds and col_bounds:
+                    # Preserve header (th) tags from existing HTML
+                    header_row_indices: set = set()
+                    if existing_html:
+                        try:
+                            tbl_elem = ET.fromstring(existing_html)
+                            for ri, tr in enumerate(tbl_elem.findall("tr")):
+                                if any(c.tag == "th" for c in tr):
+                                    header_row_indices.add(ri)
+                        except Exception:
+                            pass
+
+                    rows_html = []
+                    content_rows = []
+                    for ri, (ry1, ry2) in enumerate(row_bounds):
+                        cells_html = []
+                        content_cells = []
+                        for ci, (cx1, cx2) in enumerate(col_bounds):
+                            cell_bbox = {"x1": cx1, "y1": ry1, "x2": cx2, "y2": ry2}
+                            cell_text = _assign_words_to_bbox(page_words, cell_bbox)
+                            is_header = ri in header_row_indices
+                            tag = "th" if is_header else "td"
+                            cells_html.append(f"<{tag}>{_esc(cell_text)}</{tag}>")
+                            content_cells.append(cell_text)
+                        rows_html.append("<tr>" + "".join(cells_html) + "</tr>")
+                        content_rows.append(" | ".join(content_cells))
+
+                    result["table_html"] = "<table>" + "".join(rows_html) + "</table>"
+                    result["content"] = "\n".join(
+                        " | ".join(cells)
+                        for cells in (
+                            [_assign_words_to_bbox(page_words, {"x1": cx1, "y1": ry1, "x2": cx2, "y2": ry2})
+                             for ci, (cx1, cx2) in enumerate(col_bounds)]
+                            for ri, (ry1, ry2) in enumerate(row_bounds)
+                        )
+                        if any(c.strip() for c in cells)
+                    )
+
+            updated.append(result)
+
+        return jsonify({
+            "elements": updated,
+            "ocr_used": _OCR_LABELS.get(ocr_model, ocr_model),
+        })
+
+    except Exception as e:
+        return jsonify({"error": f"Rematch OCR failed: {e}"}), 500
+
+
+# ---------------------------------------------------------------------------
+# Import image folder
+# ---------------------------------------------------------------------------
+
+_YOLO_ROW_CLASSES = {"table row"}
+_YOLO_COL_CLASSES = {"table column"}
+_IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"}
+
+
+def _parse_yolo_annotations(label_file: Path, class_names: list) -> list:
+    """Parse a YOLO-format label file and return a list of element dicts.
+
+    Each line: ``class_id  cx  cy  w  h``  (all values normalised 0-1).
+
+    For table-structure datasets (rows, columns, spanning cells, headers) the
+    function groups all annotations on the page into a single ``"table"``
+    element whose bounding box is the union of all annotations.  Row separator
+    positions (normalised within the table box) are stored in ``table_rows``
+    and column separator positions in ``table_cols`` so the labeler can render
+    the grid immediately.
+    """
+    try:
+        lines = label_file.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+    except Exception:
+        return []
+
+    rows_bboxes: list[tuple] = []
+    cols_bboxes: list[tuple] = []
+    all_bboxes: list[tuple] = []
+
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) < 5:
+            continue
+        try:
+            cls_id = int(parts[0])
+            cx, cy, bw, bh = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+        except ValueError:
+            continue
+
+        x1 = max(0.0, cx - bw / 2)
+        y1 = max(0.0, cy - bh / 2)
+        x2 = min(1.0, cx + bw / 2)
+        y2 = min(1.0, cy + bh / 2)
+
+        cls_name = class_names[cls_id] if cls_id < len(class_names) else ""
+        all_bboxes.append((x1, y1, x2, y2))
+
+        if cls_name in _YOLO_ROW_CLASSES:
+            rows_bboxes.append((x1, y1, x2, y2))
+        elif cls_name in _YOLO_COL_CLASSES:
+            cols_bboxes.append((x1, y1, x2, y2))
+
+    if not all_bboxes:
+        return []
+
+    # Union bounding box for the whole table (values already clamped during parsing)
+    tbl_x1 = min(b[0] for b in all_bboxes)
+    tbl_y1 = min(b[1] for b in all_bboxes)
+    tbl_x2 = max(b[2] for b in all_bboxes)
+    tbl_y2 = max(b[3] for b in all_bboxes)
+    tbl_w = max(1e-6, tbl_x2 - tbl_x1)
+    tbl_h = max(1e-6, tbl_y2 - tbl_y1)
+
+    # Row dividers: bottom edge of each row (except the last), normalised within table
+    seen_rows: set[float] = set()
+    table_rows: list[float] = []
+    if rows_bboxes:
+        rows_bboxes.sort(key=lambda b: b[1])
+        for rx1, ry1, rx2, ry2 in rows_bboxes[:-1]:
+            div_y = round(max(0.0, min(1.0, (ry2 - tbl_y1) / tbl_h)), 4)
+            if div_y not in seen_rows:
+                seen_rows.add(div_y)
+                table_rows.append(div_y)
+
+    # Column dividers: right edge of each column (except the last), normalised within table
+    seen_cols: set[float] = set()
+    table_cols: list[float] = []
+    if cols_bboxes:
+        cols_bboxes.sort(key=lambda b: b[0])
+        for cx1, cy1, cx2, cy2 in cols_bboxes[:-1]:
+            div_x = round(max(0.0, min(1.0, (cx2 - tbl_x1) / tbl_w)), 4)
+            if div_x not in seen_cols:
+                seen_cols.add(div_x)
+                table_cols.append(div_x)
+
+    element: dict = {
+        "id": str(uuid.uuid4()),
+        "label": "table",
+        "content": "",
+        "bbox_norm": {
+            "x1": round(tbl_x1, 4),
+            "y1": round(tbl_y1, 4),
+            "x2": round(tbl_x2, 4),
+            "y2": round(tbl_y2, 4),
+        },
+    }
+    if table_rows:
+        element["table_rows"] = sorted(table_rows)
+    if table_cols:
+        element["table_cols"] = sorted(table_cols)
+    return [element]
+
+
+@app.route("/import_folder", methods=["POST"])
+def import_folder():
+    """
+    Import all images from a local folder into the labeler, optionally reading
+    YOLO-format table annotations from a sibling ``labels/`` subdirectory.
+
+    Accepts JSON:
+    {
+        "folder_path": str,   // absolute path or path relative to the project root
+        "run_docling": bool   // optional, default false – run Docling on each
+                              // image to detect non-table elements
+    }
+    Returns the same response format as ``/process``.
+    """
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    folder_path_raw = str(data.get("folder_path", "")).strip()
+    run_docling = bool(data.get("run_docling", False))
+
+    if not folder_path_raw:
+        return jsonify({"error": "folder_path is required"}), 400
+
+    # Resolve path (relative paths are resolved against the project root)
+    folder_path = Path(folder_path_raw)
+    if not folder_path.is_absolute():
+        folder_path = Path(BASE_DIR) / folder_path
+
+    if not folder_path.exists() or not folder_path.is_dir():
+        return jsonify({"error": f"Folder not found: {folder_path_raw}"}), 404
+
+    # Locate images (prefer images/ subdirectory, fall back to folder root)
+    img_dir = folder_path / "images"
+    if img_dir.is_dir():
+        image_files = sorted(
+            f for f in img_dir.iterdir() if f.suffix.lower() in _IMG_EXTENSIONS
+        )
+    else:
+        image_files = sorted(
+            f for f in folder_path.iterdir() if f.suffix.lower() in _IMG_EXTENSIONS
+        )
+
+    if not image_files:
+        return jsonify({"error": f"No image files found in {folder_path_raw}"}), 404
+
+    # Load YOLO class names if available
+    classes_file = folder_path / "classes.txt"
+    if classes_file.exists():
+        class_names = [
+            ln.strip()
+            for ln in classes_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            if ln.strip()
+        ]
+    else:
+        class_names = []
+
+    labels_dir = folder_path / "labels"
+
+    # Build page list; also keep a map of page_no → dest_path for the Docling pass
+    pages = []
+    elements_by_page: dict[int, list] = {}
+    dest_paths: dict[int, str] = {}
+
+    for page_no, img_file in enumerate(image_files, 1):
+        # Sanitize folder and image names to avoid path-traversal issues
+        safe_folder = re.sub(r"[^\w\-]", "_", folder_path.name)
+        safe_imgname = re.sub(r"[^\w\-.]", "_", img_file.name)
+        dest_name = f"import_{safe_folder}_{safe_imgname}"
+        dest_path = os.path.join(UPLOAD_FOLDER, dest_name)
+        shutil.copy2(str(img_file), dest_path)
+        dest_paths[page_no] = dest_path
+
+        try:
+            with Image.open(dest_path) as pil_img:
+                img_w, img_h = pil_img.size
+        except Exception:
+            img_w, img_h = 0, 0
+
+        # Read YOLO annotations if present
+        elements: list = []
+        label_file = labels_dir / (img_file.stem + ".txt") if labels_dir.is_dir() else None
+        # Also check a flat .txt alongside the image (e.g. for flat-layout folders)
+        if label_file is None or not label_file.exists():
+            flat_label = img_file.parent / (img_file.stem + ".txt")
+            if flat_label.exists():
+                label_file = flat_label
+        if label_file and label_file.exists():
+            elements = _parse_yolo_annotations(label_file, class_names)
+
+        elements_by_page[page_no] = elements
+        pages.append({
+            "page_num": page_no,
+            "image_url": f"/page_image/{dest_name}",
+            "width": img_w,
+            "height": img_h,
+            "elements": elements,
+        })
+
+    # Optionally run Docling on each image to detect non-table elements.
+    # Docling's DocumentConverter accepts images directly.
+    docling_warning = None
+    if run_docling:
+        try:
+            from docling.document_converter import DocumentConverter
+
+            converter = DocumentConverter(allowed_formats=["image"])
+            for page_no, img_file in enumerate(image_files, 1):
+                dest_path = dest_paths[page_no]
+                try:
+                    result = converter.convert(dest_path)
+                    doc = result.document
+
+                    pd = {"width": pages[page_no - 1]["width"], "height": pages[page_no - 1]["height"]}
+                    if pd["width"] == 0 or pd["height"] == 0:
+                        continue
+
+                    for item, _level in doc.iterate_items():
+                        label = item.label.value if hasattr(item.label, "value") else str(item.label)
+                        # Skip table labels – already sourced from YOLO annotations
+                        if label == "table":
+                            continue
+                        content = _get_item_text(item)
+                        if not hasattr(item, "prov") or not item.prov:
+                            continue
+                        prov_list = item.prov if isinstance(item.prov, list) else [item.prov]
+                        for prov in prov_list:
+                            raw_bbox = getattr(prov, "bbox", None)
+                            if raw_bbox is None:
+                                continue
+                            bbox_norm = _bbox_to_norm(raw_bbox, pd["width"], pd["height"])
+                            if bbox_norm is None:
+                                continue
+                            elements_by_page[page_no].append({
+                                "id": str(uuid.uuid4()),
+                                "label": label,
+                                "content": content,
+                                "bbox_norm": bbox_norm,
+                            })
+                    # Update pages list
+                    pages[page_no - 1]["elements"] = elements_by_page[page_no]
+                except Exception as img_err:
+                    docling_warning = (docling_warning or "") + f" [{img_file.name}: {img_err}]"
+        except Exception as e:
+            docling_warning = f"Docling processing failed: {e}"
+
+    resp: dict = {
+        "filename": folder_path.name,
+        "pdf_filename": "",
+        "num_pages": len(pages),
+        "pages": pages,
+    }
+    if docling_warning:
+        resp["docling_warning"] = docling_warning.strip()
+    return jsonify(resp)
 
 
 # ---------------------------------------------------------------------------

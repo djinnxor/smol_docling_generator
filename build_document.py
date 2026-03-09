@@ -163,6 +163,27 @@ _ELEMENT_RE = re.compile(
     re.DOTALL,
 )
 
+_DOCTAG_INNER_RE = re.compile(r"<doctag>(.*?)</doctag>", re.DOTALL)
+_PAGEBREAK_SPLIT_RE = re.compile(r"\s*<page_break>\s*", re.IGNORECASE)
+
+
+def split_doctag_on_pagebreaks(doctag: str) -> list[str]:
+    """Split a combined multi-page doctag on ``<page_break>`` tokens.
+
+    Returns a list of single-page ``<doctag>…</doctag>`` strings.  If the
+    input contains no ``<page_break>``, a one-element list with the original
+    doctag is returned unchanged.
+    """
+    if "<page_break>" not in doctag.lower():
+        return [doctag]
+    m = _DOCTAG_INNER_RE.search(doctag)
+    if not m:
+        return [doctag]
+    inner = m.group(1)
+    parts = _PAGEBREAK_SPLIT_RE.split(inner)
+    result = [f"<doctag>{p.strip()}</doctag>" for p in parts if p.strip()]
+    return result if result else [doctag]
+
 
 def parse_doctag(doctag: str) -> list[DocElement]:
     """Parse a DocTag string into a list of positioned document elements."""
@@ -548,6 +569,112 @@ def load_doctags_from_file(path: str) -> list[str]:
     return [raw]
 
 
+def load_records_from_file(path: str) -> list[dict]:
+    """Load records from a file, preserving ``image`` paths alongside doctags.
+
+    Supports the same formats as :func:`load_doctags_from_file`:
+
+    * ``.jsonl`` – one JSON object per line; each object must have a
+      ``"doctag"`` key and may have an ``"image"`` key.
+    * ``.json``  – a single object, list of objects, or bare string.
+    * ``.txt``   – raw DocTag text (no image information).
+
+    Returns a list of dicts, each with at least ``{"doctag": str}`` and
+    optionally ``{"image": str | list[str]}``.
+    """
+    p = Path(path)
+    raw = p.read_text(encoding="utf-8").strip()
+
+    if p.suffix == ".jsonl":
+        records: list[dict] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if isinstance(obj, dict) and "doctag" in obj:
+                records.append({"doctag": obj["doctag"], "image": obj.get("image")})
+            elif isinstance(obj, str):
+                records.append({"doctag": obj})
+        return records
+
+    if p.suffix == ".json":
+        data = json.loads(raw)
+        if isinstance(data, str):
+            return [{"doctag": data}]
+        if isinstance(data, dict) and "doctag" in data:
+            return [{"doctag": data["doctag"], "image": data.get("image")}]
+        if isinstance(data, list):
+            result: list[dict] = []
+            for item in data:
+                if isinstance(item, str):
+                    result.append({"doctag": item})
+                elif isinstance(item, dict) and "doctag" in item:
+                    result.append({"doctag": item["doctag"], "image": item.get("image")})
+            return result
+
+    # Fallback: raw doctag text
+    return [{"doctag": raw}]
+
+
+def _resolve_output_path(
+    base_out: Path,
+    img_field,
+    page_rel_idx: int,
+    num_pages: int,
+    global_page_num: int,
+    fmt: str,
+) -> Path:
+    """Return the output file path for a single rendered page.
+
+    Priority order:
+
+    1. Use the ``image`` field from the JSONL record (ensures annotation and
+       rendered image names match exactly).
+    2. Fall back to a numbered scheme inside *base_out*.
+
+    Parameters
+    ----------
+    base_out:
+        The ``--output`` path supplied on the CLI (file or directory).
+    img_field:
+        Value of the ``"image"`` key from the JSONL record; may be a string,
+        a list of strings (multi-page combined entry), or ``None``.
+    page_rel_idx:
+        0-based index of this page within the current doctag's pages.
+    num_pages:
+        Total number of pages produced by the current doctag (after
+        splitting on ``<page_break>``).
+    global_page_num:
+        1-based sequential page counter across all records.
+    fmt:
+        File format extension (``"png"`` or ``"pdf"``).
+    """
+    if img_field is not None:
+        if isinstance(img_field, list):
+            # Multi-page combined entry: each page has its own image name
+            if page_rel_idx < len(img_field):
+                return Path(img_field[page_rel_idx])
+            # More pages than image entries: fall through to fallback
+        elif isinstance(img_field, str):
+            if num_pages == 1:
+                # Single-page record with a known image name
+                return Path(img_field)
+            else:
+                # Single image name but doctag was split into multiple pages:
+                # append a page suffix so filenames are unique
+                p = Path(img_field)
+                sfx = p.suffix or f".{fmt}"
+                return p.parent / f"{p.stem}_p{page_rel_idx + 1:02d}{sfx}"
+
+    # No image field: use base_out as directory (or exact file for single pages)
+    if base_out.suffix.lower() in (".png", ".jpg", ".jpeg", ".pdf"):
+        if num_pages == 1 and global_page_num == 1:
+            return base_out
+        return base_out.parent / f"page_{global_page_num}.{fmt}"
+    return base_out / f"page_{global_page_num}.{fmt}"
+
+
 def save_output(
     images: list[Image.Image],
     output_path: str,
@@ -630,25 +757,50 @@ def main() -> None:
         ext = Path(args.output).suffix.lower()
         fmt = "pdf" if ext == ".pdf" else "png"
 
-    # Load DocTag strings
+    # Load records (doctag + optional image path from JSONL)
     if args.doctag:
-        doctags = [args.doctag]
+        records = [{"doctag": args.doctag, "image": None}]
     else:
-        doctags = load_doctags_from_file(args.input)
+        records = load_records_from_file(args.input)
 
-    if not doctags:
+    if not records:
         print("No DocTag strings found in input.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Rendering {len(doctags)} page(s) …")
+    print(f"Rendering {len(records)} record(s) …")
 
-    images = []
-    for i, dt in enumerate(doctags):
-        img = render_doctag(dt, args.width, args.height, args.margin)
-        images.append(img)
-        print(f"  Page {i + 1}: {len(parse_doctag(dt))} elements")
+    out = Path(args.output)
+    written: list[str] = []
 
-    written = save_output(images, args.output, fmt)
+    if fmt == "pdf":
+        # For PDF output: collect all pages then save as a single multi-page PDF
+        all_images: list[Image.Image] = []
+        for rec in records:
+            for page_dt in split_doctag_on_pagebreaks(rec.get("doctag", "")):
+                all_images.append(render_doctag(page_dt, args.width, args.height, args.margin))
+        written = save_output(all_images, args.output, fmt)
+    else:
+        # For image output: render and save each page immediately with the
+        # filename from the record's "image" field (when available) so that
+        # rendered filenames always match the annotation file.
+        global_page_num = 0
+        for rec_idx, rec in enumerate(records):
+            dt = rec.get("doctag", "")
+            img_field = rec.get("image")  # str | list[str] | None
+            pages = split_doctag_on_pagebreaks(dt)
+            for page_rel_idx, page_dt in enumerate(pages):
+                global_page_num += 1
+                rendered = render_doctag(page_dt, args.width, args.height, args.margin)
+                n_elems = len(parse_doctag(page_dt))
+                out_path = _resolve_output_path(
+                    out, img_field, page_rel_idx, len(pages),
+                    global_page_num, fmt,
+                )
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                rendered.save(str(out_path))
+                written.append(str(out_path))
+                print(f"  Record {rec_idx + 1} page {page_rel_idx + 1}: {n_elems} elements")
+
     for fp in written:
         print(f"  → {fp}")
     print("Done.")
