@@ -36,37 +36,53 @@ class GoogleOCR:
             ]
         }
 
-    def _post_vision(self, encoded_image: str) -> str:
-        """Post to the Vision API and return the detected text (or '').
+    def _get_auth_headers(self) -> dict:
+        """Return HTTP headers for the Vision API (api_key or bearer token)."""
+        if self.api_key:
+            return {"Content-Type": "application/json"}
+        return {
+            "Authorization": f"Bearer {getattr(self, 'access_token', '')}",
+            "Content-Type": "application/json",
+        }
+
+    def _get_url(self) -> str:
+        """Return the Vision API URL with optional api_key query parameter."""
+        if self.api_key:
+            return f"{self.vision_api_url}?key={self.api_key}"
+        return self.vision_api_url
+
+    def _post_vision_raw(self, encoded_image: str) -> dict:
+        """Post to the Vision API and return the raw JSON response dict (or {}).
 
         Timeout is controlled by the ``GOOGLE_OCR_TIMEOUT`` env var (default 30 s).
         """
-        if self.api_key:
-            url = f"{self.vision_api_url}?key={self.api_key}"
-            headers = {"Content-Type": "application/json"}
-        else:
-            url = self.vision_api_url
-            headers = {
-                "Authorization": f"Bearer {self.access_token}",
-                "Content-Type": "application/json",
-            }
         body = self._build_request_body(encoded_image)
         try:
-            response = requests.post(url, json=body, headers=headers, timeout=_VISION_TIMEOUT)
+            response = requests.post(
+                self._get_url(), json=body, headers=self._get_auth_headers(),
+                timeout=_VISION_TIMEOUT,
+            )
         except RequestException as exc:
             _logger.warning("Google Vision API request failed: %s", exc)
-            return ""
+            return {}
         if response.status_code == 200:
-            result = response.json()
-            if "responses" in result and result["responses"]:
-                annotations = result["responses"][0].get("textAnnotations", [])
-                if annotations:
-                    return annotations[0]["description"]
-        else:
-            _logger.warning(
-                "Google Vision API returned status %s: %s",
-                response.status_code, response.text[:200],
-            )
+            return response.json()
+        _logger.warning(
+            "Google Vision API returned status %s: %s",
+            response.status_code, response.text[:200],
+        )
+        return {}
+
+    def _post_vision(self, encoded_image: str) -> str:
+        """Post to the Vision API and return the detected text (or '').
+
+        Delegates to _post_vision_raw and extracts the top-level text block.
+        """
+        result = self._post_vision_raw(encoded_image)
+        if result and "responses" in result and result["responses"]:
+            annotations = result["responses"][0].get("textAnnotations", [])
+            if annotations:
+                return annotations[0].get("description", "")
         return ""
 
     def google_vision_ocr(self, image_path):
@@ -77,6 +93,33 @@ class GoogleOCR:
     def google_vision_ocr_bytes(self, image_bytes: bytes) -> str:
         """Run OCR on raw image bytes (avoids writing a temp file to disk)."""
         return self._post_vision(base64.b64encode(image_bytes).decode("utf-8"))
+
+    def google_vision_ocr_words_bytes(self, image_bytes: bytes) -> list:
+        """OCR image bytes and return word-level bounding box results.
+
+        Returns a list of dicts::
+
+            {"text": str, "vertices": [[x, y], [x, y], [x, y], [x, y]]}
+
+        The ``vertices`` list contains four pixel-coordinate corners (top-left,
+        top-right, bottom-right, bottom-left) of each detected word/phrase.
+        Caller is responsible for normalising to image dimensions.
+        """
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+        response = self._post_vision_raw(encoded)
+        words = []
+        if response and "responses" in response:
+            annotations = response["responses"][0].get("textAnnotations", [])
+            # index 0 = full-page text block; indices 1+ = individual word tokens
+            for ann in annotations[1:]:
+                text = ann.get("description", "").strip()
+                if not text:
+                    continue
+                poly = ann.get("boundingPoly", {}).get("vertices", [])
+                vertices = [[float(v.get("x", 0)), float(v.get("y", 0))] for v in poly]
+                if len(vertices) == 4:
+                    words.append({"text": text, "vertices": vertices})
+        return words
     
     def calculate_similarity(self, text1, text2):
         def normalize(text):

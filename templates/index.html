@@ -522,6 +522,7 @@
       <button class="btn btn-danger" onclick="removePage()" id="btn-remove-page" disabled title="Remove current page from annotations">🗑 Remove Page</button>
       <button class="btn btn-secondary" onclick="restorePage()" id="btn-restore-page" style="display:none" title="Restore removed page">↩ Restore Page</button>
       <button class="btn btn-secondary" onclick="redetectTables()" id="btn-redetect" disabled title="Re-run table detection on current page (uses the OCR model selected above)">🔍 Re-detect Tables</button>
+      <button class="btn btn-secondary" onclick="rematchOCR()" id="btn-rematch" disabled title="OCR the full page once and re-assign text to all elements by location. For tables, also re-populates individual cells.">🔄 Rematch OCR</button>
       <div id="mode-buttons">
         <button class="mode-btn active" id="mode-select" onclick="setMode('select')" title="Select mode (click to pick an element)">↖ Select</button>
         <button class="mode-btn" id="mode-draw" onclick="setMode('draw')" title="Draw mode (drag to create new element)">✏️ Draw</button>
@@ -593,19 +594,23 @@
         <div id="table-struct-section" style="display:none">
           <div class="table-struct-header">Table Structure</div>
           <div id="table-struct-info"></div>
+          <div id="table-struct-hint" style="font-size:.72rem;color:var(--text2);margin-bottom:5px">
+            Drag lines to move · <strong>Double-click</strong> a line to delete it (merges cells)
+          </div>
           <div class="table-struct-btns">
             <button class="btn btn-secondary" onclick="addTableRow()">+ Row</button>
             <button class="btn btn-secondary" onclick="removeTableRow()">− Row</button>
             <button class="btn btn-secondary" onclick="addTableCol()">+ Col</button>
             <button class="btn btn-secondary" onclick="removeTableCol()">− Col</button>
             <button class="btn btn-warning" onclick="ocrAllCells()" title="Run OCR on every cell (uses the OCR model selected in the toolbar)">🔍 OCR All Cells</button>
+            <button class="btn btn-success" onclick="applyTablePreviewEdits()" title="Commit any cell text edits made in the preview table below">💾 Save Cell Edits</button>
           </div>
         </div>
 
         <!-- Table reconstruction (visible for table elements only, below OCR Region button) -->
         <div id="table-preview">
           <div id="table-preview-header" onclick="toggleTablePreview()">
-            📊 Table Reconstruction <span id="table-preview-toggle">▼ show</span>
+            📊 Table Preview <span style="font-size:.7rem;font-weight:400;color:var(--text2)">(cells are editable)</span> <span id="table-preview-toggle">▼ show</span>
           </div>
           <div id="table-preview-body" style="display:none">
             <div id="table-preview-content"></div>
@@ -762,12 +767,11 @@ async function processPDF() {
     document.getElementById('btn-next').disabled = false;
     document.getElementById('btn-remove-page').disabled = false;
     document.getElementById('btn-redetect').disabled = false;
+    document.getElementById('btn-rematch').disabled = false;
     emptyState.style.display = 'none';
 
     const total = Object.values(state.pages).reduce((s, a) => s + a.length, 0);
     setStatus(`Loaded: ${data.filename} (${data.num_pages} page${data.num_pages>1?'s':''}, ${total} elements)`, 'ok');
-
-    loadPage(1);
     buildLegend();
     updateStats();
 
@@ -1209,6 +1213,30 @@ canvas.addEventListener('mouseleave', () => {
   if (state.drawing) { state.drawing = false; renderCanvas(); }
 });
 
+// ── Double-click on a table separator line → delete it (merge adjacent cells) ─
+canvas.addEventListener('dblclick', e => {
+  if (state.mode !== 'select') return;
+  const rect = canvas.getBoundingClientRect();
+  const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+  const tableLineHit = getTableLineHit(cx, cy);
+  if (!tableLineHit) return;
+  const el = getCurrentPageElement(state.selectedId);
+  if (!el || el.label !== 'table') return;
+  e.preventDefault();
+
+  if (tableLineHit.type === 'row') {
+    el.table_rows = (el.table_rows || []).filter((_, i) => i !== tableLineHit.index);
+    toast('Row separator deleted – adjacent cells merged.', 'success');
+  } else {
+    el.table_cols = (el.table_cols || []).filter((_, i) => i !== tableLineHit.index);
+    toast('Column separator deleted – adjacent cells merged.', 'success');
+  }
+  syncTableHtml(el);
+  renderCanvas();
+  updateTableStructInfo(el);
+  renderTablePreview(el);
+});
+
 // ─── Element selection & editing ──────────────────────────────────────────────
 function selectElement(id, opts) {
   // opts: { switchToEdit: bool (default true), scrollList: bool (default true) }
@@ -1501,8 +1529,23 @@ function renderTablePreview(el) {
       content.innerHTML = html;
     } else {
       content.innerHTML = `<span class="table-preview-empty">No structured table data available.<br>Raw content shown in the textarea above.</span>`;
+      return;
     }
   }
+
+  // Make each cell editable; auto-sync changes back to el.table_html on blur
+  content.querySelectorAll('td, th').forEach(cell => {
+    cell.contentEditable = 'true';
+    cell.style.outline = 'none';
+    cell.style.minWidth = '20px';
+    cell.addEventListener('blur', () => {
+      const tbl = content.querySelector('table');
+      if (!tbl || !state.selectedId) return;
+      const selEl = getCurrentPageElement(state.selectedId);
+      if (!selEl || selEl.label !== 'table') return;
+      selEl.table_html = serializePreviewTable(tbl);
+    });
+  });
 }
 
 function toggleTablePreview() {
@@ -1511,6 +1554,111 @@ function toggleTablePreview() {
   const shown  = body.style.display !== 'none';
   body.style.display = shown ? 'none' : '';
   toggle.textContent = shown ? '▼ show' : '▲ hide';
+}
+
+// ─── Serialize the live preview table back to clean HTML (no contenteditable) ─
+function serializePreviewTable(tableEl) {
+  const rows = tableEl.querySelectorAll('tr');
+  let html = '<table>';
+  rows.forEach(tr => {
+    html += '<tr>';
+    tr.querySelectorAll('td, th').forEach(cell => {
+      const tag = cell.tagName.toLowerCase();
+      const attrs = [];
+      const rowspan = cell.getAttribute('rowspan');
+      const colspan = cell.getAttribute('colspan');
+      if (rowspan && rowspan !== '1') attrs.push(`rowspan="${escHtml(rowspan)}"`);
+      if (colspan && colspan !== '1') attrs.push(`colspan="${escHtml(colspan)}"`);
+      const attrStr = attrs.length ? ' ' + attrs.join(' ') : '';
+      const text = escHtml(cell.textContent);
+      html += `<${tag}${attrStr}>${text}</${tag}>`;
+    });
+    html += '</tr>';
+  });
+  html += '</table>';
+  return html;
+}
+
+// ─── Commit cell text edits from the preview table into the element state ─────
+function applyTablePreviewEdits() {
+  if (!state.selectedId) { toast('No table selected.', 'error'); return; }
+  const el = getCurrentPageElement(state.selectedId);
+  if (!el || el.label !== 'table') { toast('Selected element is not a table.', 'error'); return; }
+
+  const previewTable = document.querySelector('#table-preview-content table');
+  if (!previewTable) { toast('No table preview to save.', 'error'); return; }
+
+  el.table_html = serializePreviewTable(previewTable);
+
+  // Rebuild content field as a pipe-separated summary
+  const rows_text = [];
+  previewTable.querySelectorAll('tr').forEach(tr => {
+    const cells = [];
+    tr.querySelectorAll('td, th').forEach(td => cells.push(td.textContent.trim()));
+    if (cells.some(c => c)) rows_text.push(cells.join(' | '));
+  });
+  el.content = rows_text.join('\n');
+  document.getElementById('edit-content').value = el.content;
+
+  buildElementsList();
+  toast('Table cell edits saved.', 'success');
+}
+
+// ─── Rematch OCR ───────────────────────────────────────────────────────────────
+async function rematchOCR() {
+  if (!state.totalPages) { toast('Load a document first.', 'error'); return; }
+
+  const ocrModel = document.getElementById('ocr-model-select').value;
+  if (ocrModel === 'none') {
+    toast('Select an OCR model (Google or EasyOCR) before rematching.', 'error');
+    return;
+  }
+
+  const imgUrl = state.pageImages[state.currentPage] || '';
+  const imgFilename = imgUrl.replace(/^.*\//, '');
+  if (!imgFilename) { toast('Page image not available.', 'error'); return; }
+
+  const elements = state.pages[state.currentPage] || [];
+  const ocrLabel = ocrModel === 'easyocr' ? 'EasyOCR' : 'Google OCR';
+  showSpinner(`${ocrLabel}: OCR-ing full page and rematching text…`);
+
+  try {
+    const resp = await fetch('/rematch_ocr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image_filename: imgFilename, elements, ocr_model: ocrModel }),
+    });
+    const data = await resp.json();
+    hideSpinner();
+    if (data.error) { toast('Rematch failed: ' + data.error, 'error'); return; }
+
+    // Apply updated text/html to local elements
+    (data.elements || []).forEach(u => {
+      const el = (state.pages[state.currentPage] || []).find(e => e.id === u.id);
+      if (!el) return;
+      if (u.content !== undefined) el.content = u.content;
+      if (u.table_html !== undefined) el.table_html = u.table_html;
+    });
+
+    renderCanvas();
+    buildElementsList();
+
+    // Refresh edit panel + table preview if an element is selected
+    if (state.selectedId) {
+      const selEl = getCurrentPageElement(state.selectedId);
+      if (selEl) {
+        updateEditPanel(selEl);
+        renderTablePreview(selEl);
+      }
+    }
+
+    const usedLabel = data.ocr_used || ocrLabel;
+    const n = (data.elements || []).length;
+    toast(`✔ ${usedLabel}: text rematched for ${n} element${n !== 1 ? 's' : ''}.`, 'success');
+  } catch (e) {
+    hideSpinner();
+    toast('Rematch error: ' + e.message, 'error');
+  }
 }
 
 function markdownTableToHtml(md) {
@@ -1941,6 +2089,7 @@ async function importFolder() {
     document.getElementById('btn-next').disabled        = false;
     document.getElementById('btn-remove-page').disabled = false;
     document.getElementById('btn-redetect').disabled    = false;
+    document.getElementById('btn-rematch').disabled     = false;
     emptyState.style.display = 'none';
 
     const total = Object.values(state.pages).reduce((s, a) => s + a.length, 0);
