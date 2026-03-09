@@ -30,31 +30,38 @@ def load_model(model_path):
     return custom_model
 
 def run_ocr(model, image_path):
-    image = Image.open(image_path).convert("L")
-    # Assuming model expects a tensor input; adapt preprocessing as needed
     from torchvision import transforms
-    preprocess = transforms.Compose([
-        transforms.Resize((256, 256)),
+
+    img_height = config['imgH']
+    transform = transforms.Compose([
         transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,))
     ])
-    input_tensor = preprocess(image).unsqueeze(0)
+
+    image = Image.open(image_path).convert("L")
+    img_w, img_h = image.size
+    aspect_ratio = img_w / img_h
+    new_w = int(img_height * aspect_ratio)
+    resized = image.resize((new_w, img_height), Image.LANCZOS)
+
+    input_tensor = transform(resized).unsqueeze(0)
     with torch.no_grad():
         output = model(input_tensor, None)
-    # Adapt output parsing as needed for your OCR model
 
     _, preds_index = output.max(2)
     preds_index = preds_index.squeeze(0)
-    
+
+    character_list = ['[blank]'] + list(config['character_list'])
     result = []
     prev_char = None
     for char_idx_tensor in preds_index:
         char_idx = char_idx_tensor.item()
         if char_idx != 0 and char_idx != prev_char:
-            result.append(config['character_list'][char_idx])
+            result.append(character_list[char_idx])
         prev_char = char_idx
 
     custom_word = ''.join(result).strip()
-    
+
     return custom_word
 
 def compare_ocr_models(model_folder, image_path):
