@@ -24,7 +24,10 @@ Usage:
 
 import argparse
 import json
+import math
 import os
+import signal
+import sys
 from pathlib import Path
 
 import torch
@@ -34,6 +37,9 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoProcessor,
     Trainer,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
     TrainingArguments,
 )
 
@@ -41,6 +47,10 @@ from transformers import (
 DEFAULT_MODEL_ID = "ibm-granite/granite-docling-258M"
 
 SYSTEM_PROMPT = "Convert this document page to DocTags format."
+
+# Maximum loss value used when clamping before computing perplexity (avoids
+# math.exp overflow for very large loss values early in training).
+_MAX_LOSS_FOR_PERPLEXITY = 20
 
 
 class DocTagDataset(Dataset):
@@ -183,6 +193,214 @@ def doctag_data_collator(features: list[dict]) -> dict:
     return batch
 
 
+# ---------------------------------------------------------------------------
+# Training metrics callback
+# ---------------------------------------------------------------------------
+
+class TrainingMetricsCallback(TrainerCallback):
+    """
+    Callback that:
+
+    * Clearly labels every log line as *Train loss* or *Val loss* so the two
+      are easy to distinguish in the console output.
+    * Computes and displays perplexity alongside the loss.
+    * Persists the full training history as ``training_history.json`` inside
+      the output directory.
+    * Generates training-curve plots (loss + perplexity) at the end of
+      training.
+    """
+
+    def __init__(self, output_dir: str) -> None:
+        self.output_dir = output_dir
+        self.history: dict[str, list] = {
+            "train_steps": [],
+            "train_loss": [],
+            "train_perplexity": [],
+            "train_lr": [],
+            "eval_epochs": [],
+            "eval_loss": [],
+            "eval_perplexity": [],
+        }
+
+    # ------------------------------------------------------------------
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs: dict | None = None,
+        **kwargs,
+    ) -> None:
+        if not logs:
+            return
+
+        step = state.global_step
+        epoch = state.epoch or 0.0
+
+        if "loss" in logs and "eval_loss" not in logs:
+            # ---- training step ----
+            train_loss = logs["loss"]
+            perplexity = math.exp(min(train_loss, _MAX_LOSS_FOR_PERPLEXITY))  # clamp to avoid overflow
+            lr = logs.get("learning_rate", 0.0)
+            self.history["train_steps"].append(step)
+            self.history["train_loss"].append(train_loss)
+            self.history["train_perplexity"].append(perplexity)
+            self.history["train_lr"].append(lr)
+            print(
+                f"[Step {step:>6} | Epoch {epoch:.2f}]  "
+                f"Train loss: {train_loss:.4f}  |  "
+                f"Perplexity: {perplexity:.2f}  |  "
+                f"LR: {lr:.2e}"
+            )
+
+        if "eval_loss" in logs:
+            # ---- validation epoch ----
+            eval_loss = logs["eval_loss"]
+            perplexity = math.exp(min(eval_loss, _MAX_LOSS_FOR_PERPLEXITY))
+            self.history["eval_epochs"].append(epoch)
+            self.history["eval_loss"].append(eval_loss)
+            self.history["eval_perplexity"].append(perplexity)
+            print(
+                f"[Epoch {epoch:.1f}]                "
+                f"Val loss:   {eval_loss:.4f}  |  "
+                f"Perplexity: {perplexity:.2f}"
+            )
+
+    # ------------------------------------------------------------------
+    def on_train_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> None:
+        os.makedirs(self.output_dir, exist_ok=True)
+        history_path = os.path.join(self.output_dir, "training_history.json")
+        with open(history_path, "w", encoding="utf-8") as fh:
+            json.dump(self.history, fh, indent=2)
+        print(f"Training history saved to {history_path}")
+        _plot_training_curves(self.history, self.output_dir)
+
+
+# ---------------------------------------------------------------------------
+# Training-curve visualisation
+# ---------------------------------------------------------------------------
+
+def _plot_training_curves(history: dict, output_dir: str) -> None:
+    """Save a 2×2 grid of training-curve plots to *output_dir*."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(
+            "matplotlib is not installed; skipping training curve plot.  "
+            "Install it with:  pip install matplotlib"
+        )
+        return
+
+    has_train = bool(history.get("train_steps") and history.get("train_loss"))
+    has_eval = bool(history.get("eval_epochs") and history.get("eval_loss"))
+
+    if not has_train and not has_eval:
+        return
+
+    nrows = 1 + int(has_eval)
+    fig, axes = plt.subplots(nrows, 2, figsize=(14, 5 * nrows), squeeze=False)
+    fig.suptitle("Training Progress", fontsize=14, y=1.01)
+
+    if has_train:
+        axes[0, 0].plot(
+            history["train_steps"],
+            history["train_loss"],
+            color="steelblue",
+            linewidth=1.2,
+            alpha=0.8,
+        )
+        axes[0, 0].set_title("Train Loss (per step)")
+        axes[0, 0].set_xlabel("Step")
+        axes[0, 0].set_ylabel("Loss")
+        axes[0, 0].grid(True, alpha=0.3)
+
+        axes[0, 1].plot(
+            history["train_steps"],
+            history["train_perplexity"],
+            color="steelblue",
+            linewidth=1.2,
+            alpha=0.8,
+        )
+        axes[0, 1].set_title("Train Perplexity (per step)")
+        axes[0, 1].set_xlabel("Step")
+        axes[0, 1].set_ylabel("Perplexity")
+        axes[0, 1].grid(True, alpha=0.3)
+
+    if has_eval:
+        row = 1 if has_train else 0
+        axes[row, 0].plot(
+            history["eval_epochs"],
+            history["eval_loss"],
+            color="darkorange",
+            linewidth=2,
+            marker="o",
+            markersize=6,
+        )
+        axes[row, 0].set_title("Val Loss (per epoch)")
+        axes[row, 0].set_xlabel("Epoch")
+        axes[row, 0].set_ylabel("Loss")
+        axes[row, 0].grid(True, alpha=0.3)
+
+        axes[row, 1].plot(
+            history["eval_epochs"],
+            history["eval_perplexity"],
+            color="darkorange",
+            linewidth=2,
+            marker="o",
+            markersize=6,
+        )
+        axes[row, 1].set_title("Val Perplexity (per epoch)")
+        axes[row, 1].set_xlabel("Epoch")
+        axes[row, 1].set_ylabel("Perplexity")
+        axes[row, 1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(output_dir, "training_curves.png")
+    try:
+        plt.savefig(plot_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Training curves saved to {plot_path}")
+    except Exception as exc:
+        print(f"Could not save training curves: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Signal / interrupt handling
+# ---------------------------------------------------------------------------
+
+def _install_signal_handlers(trainer: Trainer) -> None:
+    """Install SIGINT and SIGTERM handlers that save an emergency checkpoint.
+
+    The *trainer* instance is captured in a closure so no global mutable state
+    is needed.
+    """
+
+    def _handler(signum: int, frame) -> None:
+        sig_name = signal.Signals(signum).name
+        print(f"\n[Signal {sig_name}] Interrupted.  Saving emergency checkpoint …")
+        try:
+            save_dir = os.path.join(trainer.args.output_dir, "emergency_checkpoint")
+            trainer.save_model(save_dir)
+            print(f"Emergency checkpoint saved to: {save_dir}")
+        except Exception as exc:
+            print(f"Could not save emergency checkpoint: {exc}")
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
+
+
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fine-tune ibm-granite/granite-docling-258M for DocTag generation"
@@ -236,6 +454,16 @@ def main() -> None:
         type=float,
         default=0.05,
         help="LoRA dropout probability (default: 0.05)",
+    )
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of epoch checkpoints to keep inside --output_dir. "
+            "Oldest checkpoints are deleted when the limit is exceeded. "
+            "Default: None (keep all)."
+        ),
     )
     args = parser.parse_args()
 
@@ -300,7 +528,13 @@ def main() -> None:
         logging_steps=10,
         save_strategy="epoch",
         eval_strategy="epoch" if val_dataset is not None else "no",
-        save_total_limit=2,
+        # Keep all per-epoch checkpoints by default so no work is ever lost.
+        # Pass --save_total_limit N to cap the number of saved checkpoints.
+        save_total_limit=args.save_total_limit,
+        # Load the best checkpoint at the end when validation is available.
+        load_best_model_at_end=val_dataset is not None,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         remove_unused_columns=False,
         dataloader_num_workers=0,
         report_to="none",
@@ -310,20 +544,43 @@ def main() -> None:
         gradient_checkpointing_kwargs={"use_reentrant": False},
     )
 
+    metrics_callback = TrainingMetricsCallback(output_dir=args.output_dir)
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=doctag_data_collator,
+        callbacks=[metrics_callback],
     )
 
-    print("Starting training …")
-    trainer.train()
+    # Install signal handlers (closure captures trainer, no global needed).
+    _install_signal_handlers(trainer)
 
+    print("Starting training …")
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.  Saving emergency checkpoint …")
+        emergency_dir = os.path.join(args.output_dir, "emergency_checkpoint")
+        trainer.save_model(emergency_dir)
+        processor.save_pretrained(emergency_dir)
+        print(f"Emergency checkpoint saved to {emergency_dir}")
+        raise
+
+    # Save the best (or final) model to the requested output directory.
     print(f"Saving fine-tuned model to {args.output_dir}")
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
+
+    # Also write the best model to a dedicated sub-directory so it is always
+    # easy to locate regardless of checkpoint rotation.
+    best_model_dir = os.path.join(args.output_dir, "best_model")
+    print(f"Saving best model to {best_model_dir}")
+    trainer.save_model(best_model_dir)
+    processor.save_pretrained(best_model_dir)
+
     print("Done.")
 
 
