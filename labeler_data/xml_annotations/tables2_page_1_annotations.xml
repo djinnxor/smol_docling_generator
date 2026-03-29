@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<page num="1" image="tables2_page_1" width="1650" height="1275">
-  <section_header bbox_x1="0.0707" bbox_y1="0.0986" bbox_x2="0.8426" bbox_y2="0.128">Монгол Улсын Эдийн Засгийн Тайлан (Letter Landscape формат)</section_header>
-  <caption bbox_x1="0.0707" bbox_y1="0.1765" bbox_x2="0.2974" bbox_y2="0.1928">Зураг 1: ДНБ-ийн баганан график</caption>
-  <picture bbox_x1="0.2384" bbox_y1="0.2245" bbox_x2="0.762" bbox_y2="0.557">self_ref='#/pictures/0' parent=RefItem(cref='#/body') children=[RefItem(cref='#/texts/2'), RefItem(cref='#/texts/3'), RefItem(cref='#/texts/4'), RefItem(cref='#/texts/5'), RefItem(cref='#/texts/6'), RefItem(cref='#/texts/7'), RefItem(cref='#/texts/8'), RefItem(cref='#/texts/9'), RefItem(cref='#/texts/10'), RefItem(cref='#/texts/11'), RefItem(cref='#/texts/12'), RefItem(cref='#/texts/13'), RefItem(cref='#/texts/14'), RefItem(cref='#/texts/15')] content_layer=&lt;ContentLayer.BODY: 'body'&gt; meta=None label=&lt;DocItemLabel.PICTURE: 'picture'&gt; prov=[ProvenanceItem(page_no=1, bbox=BoundingBox(l=188.8213348388672, t=474.5884246826172, r=603.4857788085938, b=271.1155700683594, coord_origin=&lt;CoordOrigin.BOTTOMLEFT: 'BOTTOMLEFT'&gt;), charspan=(0, 0))] source=[] comments=[] captions=[RefItem(cref='#/texts/2')] references=[] footnotes=[] image=None annotations=[]</picture>
-  <caption bbox_x1="0.0707" bbox_y1="0.6314" bbox_x2="0.2921" bbox_y2="0.6477">Зураг 2: Жишээ шугаман график</caption>
-</page>
