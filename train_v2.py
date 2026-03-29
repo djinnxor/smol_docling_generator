@@ -733,10 +733,10 @@ class DocTagTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self._length_sorted_sampler = length_sorted_sampler
 
-    def _get_train_sampler(self):
+    def _get_train_sampler(self, *args, **kwargs):
         if self._length_sorted_sampler is not None:
             return self._length_sorted_sampler
-        return super()._get_train_sampler()
+        return super()._get_train_sampler(*args, **kwargs)
 
 
 # ── main ──────────────────────────────────────────────────────────────────
