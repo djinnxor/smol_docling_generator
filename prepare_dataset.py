@@ -97,8 +97,13 @@ def table_xml_to_template_doctag(table_elem, scale=500):
     if inner_table is None:
         inner_table = table_elem
 
+
     rows = inner_table.findall("tr")
     doctag_rows = []
+
+    if not rows:
+        # No rows found, return empty table tag with location info
+        return f"<otsl>{loc_str}</otsl>"
 
     # Header row
     header_cells = rows[0]
