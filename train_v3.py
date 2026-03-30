@@ -82,6 +82,7 @@ import copy
 import json
 import math
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import random
 import re
 import signal
