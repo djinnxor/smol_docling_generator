@@ -1,20 +1,5 @@
 """
-Fine-tune ibm-granite/granite-docling-258M on Mongolian document pages
-to output DocTag format.
-
-The script loads (image, doctag) pairs from JSONL files produced by
-prepare_dataset.py, fine-tunes the vision-language model using the
-HuggingFace Trainer API, and saves the result to --output_dir.
-
-LoRA (parameter-efficient fine-tuning) is strongly recommended to reduce
-VRAM requirements. Pass --lora to enable it (requires peft).
-
 Usage:
-    # 1. Build the training dataset first
-    python prepare_dataset.py --xml_dir dataset/xml_annotations \\
-                               --images_dir dataset/uploads
-
-    # 2. Train
     python train.py --train_data training_data_train.jsonl \\
                     --val_data   training_data_val.jsonl   \\
                     --lora                                 \\
@@ -24,7 +9,12 @@ Usage:
 
 import argparse
 import json
+import math
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import re
+import signal
+import sys
 from pathlib import Path
 
 import torch
@@ -34,6 +24,9 @@ from transformers import (
     AutoModelForImageTextToText,
     AutoProcessor,
     Trainer,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
     TrainingArguments,
 )
 
@@ -41,6 +34,110 @@ from transformers import (
 DEFAULT_MODEL_ID = "ibm-granite/granite-docling-258M"
 
 SYSTEM_PROMPT = "Convert this document page to DocTags format."
+
+# Maximum loss value used when clamping before computing perplexity (avoids
+# math.exp overflow for very large loss values early in training).
+_MAX_LOSS_FOR_PERPLEXITY = 20
+
+# DocTag structural tags used for tag-accuracy and tree-edit-distance metrics.
+_STRUCTURAL_TAGS = frozenset({
+    "doctag", "text", "section_header_level_1", "section_header_level_2",
+    "section_header_level_3", "title", "caption", "picture", "otsl",
+    "list_item", "formula", "page_header", "page_footer", "code", "footnote",
+})
+
+
+def _extract_structural_tags(s: str) -> list[str]:
+    """Return ordered list of structural open/close tags from a DocTag string."""
+    return [
+        ("/" if slash else "") + tag
+        for slash, tag in re.findall(r'<(/?)(\w+(?:_\w+)*)(?:[^>]*)?>', s)
+        if tag in _STRUCTURAL_TAGS
+    ]
+
+
+def _tag_accuracy(pred: str, ref: str) -> float:
+    """Positional accuracy of structural tags (open + close) between pred and ref."""
+    pred_tags = _extract_structural_tags(pred)
+    ref_tags = _extract_structural_tags(ref)
+    if not ref_tags and not pred_tags:
+        return 1.0
+    if not ref_tags or not pred_tags:
+        return 0.0
+    matches = sum(p == r for p, r in zip(pred_tags, ref_tags))
+    return matches / max(len(pred_tags), len(ref_tags))
+
+
+def _loc_mae(pred: str, ref: str) -> float:
+    """Mean absolute error on <loc_N> values (scale 0–500).
+    Missing predicted tokens are treated as predicting 0."""
+    pred_locs = [int(n) for n in re.findall(r'<loc_(\d+)>', pred)]
+    ref_locs = [int(n) for n in re.findall(r'<loc_(\d+)>', ref)]
+    if not ref_locs:
+        return 0.0
+    total = sum(
+        abs(pred_locs[i] - ref_locs[i]) if i < len(pred_locs) else ref_locs[i]
+        for i in range(len(ref_locs))
+    )
+    return total / len(ref_locs)
+
+
+def _tree_edit_dist(pred: str, ref: str) -> float:
+    """Normalised tree edit distance on the structural DocTag tree (0 = identical, 1 = worst).
+    Uses the zss library when available; falls back to tag-sequence Levenshtein."""
+    try:
+        import zss
+
+        def _build(s):
+            class _N:
+                def __init__(self, label):
+                    self.label = label
+                    self.children: list = []
+            root = _N("root")
+            stack = [root]
+            for slash, tag in re.findall(r'<(/?)(\w+(?:_\w+)*)(?:[^>]*)?>', s):
+                if tag not in _STRUCTURAL_TAGS:
+                    continue
+                if not slash:
+                    node = _N(tag)
+                    stack[-1].children.append(node)
+                    stack.append(node)
+                elif len(stack) > 1:
+                    stack.pop()
+            return root
+
+        def _to_zss(n):
+            z = zss.Node(n.label)
+            for c in n.children:
+                z.addkid(_to_zss(c))
+            return z
+
+        def _size(n):
+            return 1 + sum(_size(c) for c in n.get_children())
+
+        pt = _to_zss(_build(pred))
+        rt = _to_zss(_build(ref))
+        dist = zss.simple_distance(pt, rt)
+        max_dist = _size(pt) + _size(rt)
+        return dist / max_dist if max_dist > 0 else 0.0
+
+    except ImportError:
+        # Fallback: tag-sequence normalised edit distance
+        pred_tags = _extract_structural_tags(pred)
+        ref_tags = _extract_structural_tags(ref)
+        if not pred_tags and not ref_tags:
+            return 0.0
+        n, m = len(pred_tags), len(ref_tags)
+        if n == 0 or m == 0:
+            return 1.0
+        prev = list(range(m + 1))
+        for i in range(1, n + 1):
+            curr = [i] + [0] * m
+            for j in range(1, m + 1):
+                cost = 0 if pred_tags[i - 1] == ref_tags[j - 1] else 1
+                curr[j] = min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+            prev = curr
+        return prev[m] / max(n, m)
 
 
 class DocTagDataset(Dataset):
@@ -72,7 +169,7 @@ class DocTagDataset(Dataset):
         record = self.records[idx]
         image = Image.open(record["image"]).convert("RGB")
         doctag = record["doctag"]
-
+        
         # --- build full conversation (prompt + response) ---
         messages_full = [
             {
@@ -109,7 +206,7 @@ class DocTagDataset(Dataset):
         prompt_ids = self.processor.tokenizer(
             text_prompt,
             add_special_tokens=False,
-            truncation=False,
+            truncation=True,
             max_length=self.max_length,
         ).input_ids
 
@@ -118,9 +215,10 @@ class DocTagDataset(Dataset):
             images=image,
             text=text_full,
             return_tensors="pt",
-            truncation=False,
+            truncation=True,
             max_length=self.max_length,
         )
+        image.close()
 
         # Remove the batch dimension added by the processor
         inputs = {k: v.squeeze(0) for k, v in inputs.items()}
@@ -132,6 +230,61 @@ class DocTagDataset(Dataset):
 
         inputs["labels"] = labels
         return inputs
+
+
+def preprocess_logits_for_metrics(logits, labels):
+    """
+    Called on GPU before logits are moved to CPU.
+    Converts full logit tensors (batch x seq x vocab) → predicted token IDs (batch x seq)
+    to avoid accumulating gigabytes of logit data in CPU memory during evaluation.
+    """
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    return logits.argmax(dim=-1)
+
+
+def make_compute_metrics(tokenizer):
+    """
+    Returns a compute_metrics function for the Trainer that computes:
+    - token_acc      : fraction of non-masked tokens predicted correctly (teacher-forced)
+    - tag_acc        : positional accuracy of structural DocTag element tags
+    - loc_mae        : mean absolute error on <loc_N> location tokens (scale 0–500)
+    - tree_edit_dist : normalised tree edit distance on the structural DocTag tree
+    """
+    def _compute(eval_preds):
+        import numpy as np
+
+        predictions, labels = eval_preds
+        if isinstance(predictions, tuple):
+            predictions = predictions[0]
+
+        pred_ids = np.array(predictions, dtype=np.int64)
+
+        # -- token accuracy --
+        mask = labels != -100
+        token_acc = float((pred_ids == labels)[mask].mean()) if mask.any() else 0.0
+
+        # -- decode to strings --
+        pad_id = tokenizer.pad_token_id or 0
+        vocab_size = tokenizer.vocab_size or len(tokenizer)
+        labels_for_decode = np.where(labels == -100, pad_id, labels)
+        labels_for_decode = np.clip(labels_for_decode, 0, vocab_size - 1)
+        pred_ids_for_decode = np.clip(pred_ids, 0, vocab_size - 1)
+        pred_strs = tokenizer.batch_decode(pred_ids_for_decode.tolist(), skip_special_tokens=True)
+        ref_strs = tokenizer.batch_decode(labels_for_decode.tolist(), skip_special_tokens=True)
+
+        # -- DocTag-specific metrics --
+        tag_acc = float(np.mean([_tag_accuracy(p, r) for p, r in zip(pred_strs, ref_strs)]))
+        loc_mae = float(np.mean([_loc_mae(p, r) for p, r in zip(pred_strs, ref_strs)]))
+        tree_edit = float(np.mean([_tree_edit_dist(p, r) for p, r in zip(pred_strs, ref_strs)]))
+
+        return {
+            "token_acc": token_acc,
+            "tag_acc": tag_acc,
+            "loc_mae": loc_mae,
+            "tree_edit_dist": tree_edit,
+        }
+    return _compute
 
 
 def doctag_data_collator(features: list[dict]) -> dict:
@@ -183,6 +336,295 @@ def doctag_data_collator(features: list[dict]) -> dict:
     return batch
 
 
+# ---------------------------------------------------------------------------
+# Training metrics callback
+# ---------------------------------------------------------------------------
+
+class EvalMemoryCallback(TrainerCallback):
+    """
+    Clears GPU cache before each evaluation pass and toggles use_cache so
+    the model is memory-efficient during teacher-forced eval forward passes
+    (gradient checkpointing is off during eval, so use_cache is safe there).
+    """
+
+    def on_epoch_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def on_evaluate(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model=None,
+        **kwargs,
+    ) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if model is not None and hasattr(model, "config"):
+            model.config.use_cache = True
+
+    def on_prediction_step(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> None:
+        # Re-disable use_cache after eval is done (Trainer calls this then
+        # on_evaluate_end; we restore in on_evaluate_end instead).
+        pass
+
+    def on_evaluate_end(  # type: ignore[override]
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        model=None,
+        **kwargs,
+    ) -> None:
+        if model is not None and hasattr(model, "config"):
+            model.config.use_cache = False
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+class TrainingMetricsCallback(TrainerCallback):
+    """
+    Callback that:
+
+    * Clearly labels every log line as *Train loss* or *Val loss* so the two
+      are easy to distinguish in the console output.
+    * Computes and displays perplexity alongside the loss.
+    * Persists the full training history as ``training_history.json`` inside
+      the output directory.
+    * Generates training-curve plots (loss + perplexity) at the end of
+      training.
+    """
+
+    def __init__(self, output_dir: str) -> None:
+        self.output_dir = output_dir
+        self.history: dict[str, list] = {
+            "train_steps": [],
+            "train_loss": [],
+            "train_perplexity": [],
+            "train_lr": [],
+            "train_grad_norm": [],
+            "eval_epochs": [],
+            "eval_loss": [],
+            "eval_perplexity": [],
+            "eval_token_acc": [],
+            "eval_tag_acc": [],
+            "eval_loc_mae": [],
+            "eval_tree_edit_dist": [],
+        }
+
+    # ------------------------------------------------------------------
+    def on_log(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        logs: dict | None = None,
+        **kwargs,
+    ) -> None:
+        if not logs:
+            return
+
+        step = state.global_step
+        epoch = state.epoch or 0.0
+
+        if "loss" in logs and "eval_loss" not in logs:
+            # ---- training step ----
+            train_loss = logs["loss"]
+            perplexity = math.exp(min(train_loss, _MAX_LOSS_FOR_PERPLEXITY))  # clamp to avoid overflow
+            lr = logs.get("learning_rate", 0.0)
+            grad_norm = logs.get("grad_norm")
+            self.history["train_steps"].append(step)
+            self.history["train_loss"].append(train_loss)
+            self.history["train_perplexity"].append(perplexity)
+            self.history["train_lr"].append(lr)
+            if grad_norm is not None:
+                self.history["train_grad_norm"].append(grad_norm)
+            grad_str = f"  |  GradNorm: {grad_norm:.4f}" if grad_norm is not None else ""
+            print(
+                f"[Step {step:>6} | Epoch {epoch:.2f}]  "
+                f"Train loss: {train_loss:.4f}  |  "
+                f"Perplexity: {perplexity:.2f}  |  "
+                f"LR: {lr:.2e}{grad_str}"
+            )
+
+        if "eval_loss" in logs:
+            # ---- validation epoch ----
+            eval_loss = logs["eval_loss"]
+            perplexity = math.exp(min(eval_loss, _MAX_LOSS_FOR_PERPLEXITY))
+            token_acc = logs.get("eval_token_acc")
+            tag_acc = logs.get("eval_tag_acc")
+            loc_mae = logs.get("eval_loc_mae")
+            tree_edit = logs.get("eval_tree_edit_dist")
+            self.history["eval_epochs"].append(epoch)
+            self.history["eval_loss"].append(eval_loss)
+            self.history["eval_perplexity"].append(perplexity)
+            if token_acc is not None:
+                self.history["eval_token_acc"].append(token_acc)
+            if tag_acc is not None:
+                self.history["eval_tag_acc"].append(tag_acc)
+            if loc_mae is not None:
+                self.history["eval_loc_mae"].append(loc_mae)
+            if tree_edit is not None:
+                self.history["eval_tree_edit_dist"].append(tree_edit)
+            metrics_str = ""
+            if token_acc is not None:
+                metrics_str += f"  |  TokenAcc: {token_acc:.4f}"
+            if tag_acc is not None:
+                metrics_str += f"  |  TagAcc: {tag_acc:.4f}"
+            if loc_mae is not None:
+                metrics_str += f"  |  LocMAE: {loc_mae:.2f}"
+            if tree_edit is not None:
+                metrics_str += f"  |  TreeEdit: {tree_edit:.4f}"
+            print(
+                f"[Epoch {epoch:.1f}]                "
+                f"Val loss:   {eval_loss:.4f}  |  "
+                f"Perplexity: {perplexity:.2f}{metrics_str}"
+            )
+
+    # ------------------------------------------------------------------
+    def on_train_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> None:
+        os.makedirs(self.output_dir, exist_ok=True)
+        history_path = os.path.join(self.output_dir, "training_history.json")
+        with open(history_path, "w", encoding="utf-8") as fh:
+            json.dump(self.history, fh, indent=2)
+        print(f"Training history saved to {history_path}")
+        _plot_training_curves(self.history, self.output_dir)
+
+
+# ---------------------------------------------------------------------------
+# Training-curve visualisation
+# ---------------------------------------------------------------------------
+
+def _plot_training_curves(history: dict, output_dir: str) -> None:
+    """Save a 2×2 grid of training-curve plots to *output_dir*."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(
+            "matplotlib is not installed; skipping training curve plot.  "
+            "Install it with:  pip install matplotlib"
+        )
+        return
+
+    has_train = bool(history.get("train_steps") and history.get("train_loss"))
+    has_eval = bool(history.get("eval_epochs") and history.get("eval_loss"))
+    has_grad = bool(history.get("train_grad_norm"))
+    has_token_acc = bool(history.get("eval_token_acc"))
+    has_tag_acc = bool(history.get("eval_tag_acc"))
+    has_loc_mae = bool(history.get("eval_loc_mae"))
+    has_tree_edit = bool(history.get("eval_tree_edit_dist"))
+
+    if not has_train and not has_eval:
+        return
+
+    # Build subplot panels dynamically
+    panels = []  # list of (title, x_data, y_data, color, xlabel, ylabel)
+    if has_train:
+        panels.append(("Train Loss", history["train_steps"], history["train_loss"],
+                        "steelblue", "Step", "Loss"))
+        panels.append(("Train Perplexity", history["train_steps"], history["train_perplexity"],
+                        "steelblue", "Step", "Perplexity"))
+    if has_grad:
+        gsteps = history["train_steps"][:len(history["train_grad_norm"])]
+        panels.append(("Gradient Norm", gsteps, history["train_grad_norm"],
+                        "mediumseagreen", "Step", "Grad Norm"))
+    if has_eval:
+        panels.append(("Val Loss", history["eval_epochs"], history["eval_loss"],
+                        "darkorange", "Epoch", "Loss"))
+        panels.append(("Val Perplexity", history["eval_epochs"], history["eval_perplexity"],
+                        "darkorange", "Epoch", "Perplexity"))
+    if has_token_acc:
+        panels.append(("Val Token Accuracy", history["eval_epochs"], history["eval_token_acc"],
+                        "mediumvioletred", "Epoch", "Token Acc"))
+    if has_tag_acc:
+        panels.append(("Val Tag Accuracy", history["eval_epochs"], history["eval_tag_acc"],
+                        "darkgreen", "Epoch", "Tag Acc"))
+    if has_loc_mae:
+        panels.append(("Val Loc MAE (↓ better)", history["eval_epochs"], history["eval_loc_mae"],
+                        "crimson", "Epoch", "MAE (loc units)"))
+    if has_tree_edit:
+        panels.append(("Val Tree Edit Dist (↓ better)", history["eval_epochs"], history["eval_tree_edit_dist"],
+                        "saddlebrown", "Epoch", "Norm. Tree Edit"))
+
+    ncols = 2
+    nrows = math.ceil(len(panels) / ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 4.5 * nrows), squeeze=False)
+    fig.suptitle("Training Progress", fontsize=14, y=1.01)
+
+    for i, (title, xs, ys, color, xlabel, ylabel) in enumerate(panels):
+        ax = axes[i // ncols][i % ncols]
+        marker = "o" if xlabel == "Epoch" else None
+        lw = 2.0 if xlabel == "Epoch" else 1.2
+        ax.plot(xs, ys, color=color, linewidth=lw, marker=marker, markersize=5, alpha=0.85)
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+
+    # Hide unused axes
+    for j in range(len(panels), nrows * ncols):
+        axes[j // ncols][j % ncols].set_visible(False)
+
+    plt.tight_layout()
+    os.makedirs(output_dir, exist_ok=True)
+    plot_path = os.path.join(output_dir, "training_curves.png")
+    try:
+        plt.savefig(plot_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Training curves saved to {plot_path}")
+    except Exception as exc:
+        print(f"Could not save training curves: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Signal / interrupt handling
+# ---------------------------------------------------------------------------
+
+def _install_signal_handlers(trainer: Trainer) -> None:
+    """Install SIGINT and SIGTERM handlers that save an emergency checkpoint.
+
+    The *trainer* instance is captured in a closure so no global mutable state
+    is needed.
+    """
+
+    def _handler(signum: int, frame) -> None:
+        sig_name = signal.Signals(signum).name
+        print(f"\n[Signal {sig_name}] Interrupted.  Saving emergency checkpoint …")
+        try:
+            save_dir = os.path.join(trainer.args.output_dir, "emergency_checkpoint")
+            trainer.save_model(save_dir)
+            print(f"Emergency checkpoint saved to: {save_dir}")
+        except Exception as exc:
+            print(f"Could not save emergency checkpoint: {exc}")
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
+
+
+# ---------------------------------------------------------------------------
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fine-tune ibm-granite/granite-docling-258M for DocTag generation"
@@ -207,7 +649,7 @@ def main() -> None:
         default="doctag_model",
         help="Directory where the fine-tuned model is saved (default: doctag_model)",
     )
-    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs (default: 3)")
+    parser.add_argument("--epochs", type=int, default=2, help="Number of training epochs (default: 10)")
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -221,21 +663,39 @@ def main() -> None:
         help="Gradient accumulation steps (default: 2)",
     )
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (default: 2e-5)")
-    parser.add_argument("--max_length", type=int, default=1024, help="Maximum token length (default: 1024)")
+    parser.add_argument("--max_length", type=int, default=4096, help="Maximum token length (default: 4096)")
     parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (recommended)")
+    parser.add_argument("--flash_attn", action="store_true", help="Use Flash Attention 2 (requires flash-attn and bf16/fp16)")
+    parser.add_argument("--freeze_vision", action="store_true", help="Freeze vision encoder parameters (only train the language decoder)")
     parser.add_argument(
         "--lora",
         action="store_true",
         help="Use LoRA for parameter-efficient fine-tuning (requires peft)",
     )
-    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank (default: 16)")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha (default: 32)")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank (default: 8)")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha (default: 16)")
     parser.add_argument(
         "--lora_dropout",
         type=float,
         default=0.05,
         help="LoRA dropout probability (default: 0.05)",
+    )
+    parser.add_argument(
+        "--lora_adapter_path",
+        type=str,
+        default="/home/rookie/Documents/Minje/smol_docling_generator/doctag_model_prev",
+        help="Path to a custom LoRA adapter directory (must contain adapter_config.json). Overrides lora_r, lora_alpha, lora_dropout.",
+    )
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of epoch checkpoints to keep inside --output_dir. "
+            "Oldest checkpoints are deleted when the limit is exceeded. "
+            "Default: None (keep all)."
+        ),
     )
     args = parser.parse_args()
 
@@ -252,31 +712,62 @@ def main() -> None:
         if args.bf16
         else (torch.float16 if args.fp16 else torch.float32)
     )
-    model = AutoModelForImageTextToText.from_pretrained(args.model_id, dtype=torch_dtype)
+    if args.flash_attn and torch_dtype == torch.float32:
+        print("WARNING: Flash Attention 2 requires float16 or bfloat16. Pass --bf16 or --fp16.")
+    model = AutoModelForImageTextToText.from_pretrained(
+        args.model_id,
+        torch_dtype=torch_dtype,
+        attn_implementation="flash_attention_2" if args.flash_attn else "eager",
+    )
     # Gradient checkpointing (enabled below) is incompatible with use_cache.
     # Set it explicitly here so the Trainer does not emit a warning and the
     # model behaves consistently during both training and evaluation.
     model.config.use_cache = False
 
+    if args.freeze_vision:
+        frozen = 0
+        for name, param in model.named_parameters():
+            if "vision" in name or "image_model" in name:
+                param.requires_grad = False
+                frozen += param.numel()
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Vision encoder frozen: {frozen:,} params  |  Trainable: {trainable:,} params")
+
     if args.lora:
         try:
-            from peft import LoraConfig, TaskType, get_peft_model
+            from peft import LoraConfig, TaskType, get_peft_model, PeftModel
         except ImportError as exc:
             raise ImportError(
                 "peft is required for LoRA fine-tuning. Install it with:\n"
                 "  pip install peft"
             ) from exc
 
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-            lora_dropout=args.lora_dropout,
-            bias="none",
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+        if args.lora_adapter_path:
+            import json as _json
+            from pathlib import Path as _Path
+            adapter_path = _Path(args.lora_adapter_path)
+            config_file = adapter_path / "adapter_config.json"
+            if not config_file.exists() or config_file.stat().st_size == 0:
+                raise FileNotFoundError(
+                    f"Custom LoRA adapter not found or adapter_config.json is empty at {args.lora_adapter_path}"
+                )
+            with open(config_file, encoding="utf-8") as f:
+                adapter_cfg = _json.load(f)
+            print(f"Loading custom LoRA adapter from: {args.lora_adapter_path}")
+            print(f"  base model: {adapter_cfg['base_model_name_or_path']}")
+            model = PeftModel.from_pretrained(model, args.lora_adapter_path, is_trainable=True)
+            model.print_trainable_parameters()
+        else:
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+                lora_dropout=args.lora_dropout,
+                bias="none",
+            )
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
 
     print("Building datasets …")
     train_dataset = DocTagDataset(args.train_data, processor, args.max_length)
@@ -300,7 +791,13 @@ def main() -> None:
         logging_steps=10,
         save_strategy="epoch",
         eval_strategy="epoch" if val_dataset is not None else "no",
-        save_total_limit=2,
+        # Keep all per-epoch checkpoints by default so no work is ever lost.
+        # Pass --save_total_limit N to cap the number of saved checkpoints.
+        save_total_limit=args.save_total_limit,
+        # Load the best checkpoint at the end when validation is available.
+        load_best_model_at_end=val_dataset is not None,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
         remove_unused_columns=False,
         dataloader_num_workers=0,
         report_to="none",
@@ -308,7 +805,14 @@ def main() -> None:
         lr_scheduler_type="cosine",
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
+        # Move each batch's predictions to CPU immediately to avoid VRAM accumulation.
+        eval_accumulation_steps=1,
+        # PeftModel hides the base model's signature, so Trainer can't infer
+        # label_names automatically.  Specify them explicitly to silence the warning.
+        label_names=["labels"],
     )
+
+    metrics_callback = TrainingMetricsCallback(output_dir=args.output_dir)
 
     trainer = Trainer(
         model=model,
@@ -316,14 +820,37 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         data_collator=doctag_data_collator,
+        compute_metrics=make_compute_metrics(processor.tokenizer) if val_dataset is not None else None,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics if val_dataset is not None else None,
+        callbacks=[EvalMemoryCallback(), metrics_callback],
     )
 
-    print("Starting training …")
-    trainer.train()
+    # Install signal handlers (closure captures trainer, no global needed).
+    _install_signal_handlers(trainer)
 
+    print("Starting training …")
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.  Saving emergency checkpoint …")
+        emergency_dir = os.path.join(args.output_dir, "emergency_checkpoint")
+        trainer.save_model(emergency_dir)
+        processor.save_pretrained(emergency_dir)
+        print(f"Emergency checkpoint saved to {emergency_dir}")
+        raise
+
+    # Save the best (or final) model to the requested output directory.
     print(f"Saving fine-tuned model to {args.output_dir}")
     trainer.save_model(args.output_dir)
     processor.save_pretrained(args.output_dir)
+
+    # Also write the best model to a dedicated sub-directory so it is always
+    # easy to locate regardless of checkpoint rotation.
+    best_model_dir = os.path.join(args.output_dir, "best_model")
+    print(f"Saving best model to {best_model_dir}")
+    trainer.save_model(best_model_dir)
+    processor.save_pretrained(best_model_dir)
+
     print("Done.")
 
 
