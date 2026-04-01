@@ -73,6 +73,8 @@ _STRUCTURAL_TAGS = frozenset({
     "doctag", "text", "section_header_level_1", "section_header_level_2",
     "section_header_level_3", "title", "caption", "picture", "otsl",
     "list_item", "formula", "page_header", "page_footer", "code", "footnote",
+    # OTSL table cell tokens – required to measure table learning in tag_acc / tree_edit_dist
+    "ched", "fcel", "rhed", "ucel", "lcel", "ecel", "nl",
 })
 
 
@@ -261,7 +263,7 @@ def doctag_data_collator(features: list[dict]) -> dict:
 def preprocess_logits_for_metrics(logits, labels):  # noqa: ARG001
     if isinstance(logits, tuple):
         logits = logits[0]
-    return logits.argmax(dim=-1)
+    return logits.argmax(dim=-1).cpu()  # move to CPU immediately to avoid GPU memory accumulation
 
 
 def make_compute_metrics(tokenizer):
@@ -328,7 +330,7 @@ def main() -> None:
                         help="Per-device batch size. Aim for effective batch ≥ 16 via grad_accum.")
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--max_length", type=int, default=4096)
+    parser.add_argument("--max_length", type=int, default=8192)
     # LoRA / DoRA
     parser.add_argument("--lora_r", type=int, default=16,
                         help="LoRA rank. 32 works well for DoRA; lower (16) if VRAM is tight.")
