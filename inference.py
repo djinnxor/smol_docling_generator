@@ -35,7 +35,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
-from build_document import parse_doctag, render_doctag, save_output  
+from utils.build_document import parse_doctag, render_doctag, save_output  
 
 
 # Local folder produced by train.py --output_dir (preferred default)
