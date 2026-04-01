@@ -86,8 +86,6 @@ _STRUCTURAL_TAGS = frozenset({
 })
 
 
-# ── metric helpers (same as train.py to keep outputs compatible) ──────────
-
 def _extract_structural_tags(s: str) -> list[str]:
     return [
         ("/" if slash else "") + tag

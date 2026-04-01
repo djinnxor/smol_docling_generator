@@ -8,14 +8,28 @@ Usage:
 """
 
 import argparse
+import datetime
 import json
 import math
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 import re
 import signal
 import sys
 from pathlib import Path
+
+# Patch JSON encoder to handle numpy dtypes (compatibility fix for older
+# transformers versions that store numpy.dtype objects in model configs).
+_json_default_orig = json.JSONEncoder.default
+
+def _json_default_patched(self, obj):
+    # Handle dtype objects from numpy, torch, or any other library
+    if type(obj).__name__ == "dtype" or hasattr(obj, "itemsize"):
+        return str(obj)
+    return _json_default_orig(self, obj)
+
+json.JSONEncoder.default = _json_default_patched
 
 import torch
 from PIL import Image
@@ -113,7 +127,7 @@ def _tree_edit_dist(pred: str, ref: str) -> float:
             return z
 
         def _size(n):
-            return 1 + sum(_size(c) for c in n.get_children())
+            return 1 + sum(_size(c) for c in n.children)
 
         pt = _to_zss(_build(pred))
         rt = _to_zss(_build(ref))
@@ -140,6 +154,119 @@ def _tree_edit_dist(pred: str, ref: str) -> float:
         return prev[m] / max(n, m)
 
 
+import random as _random
+from dataclasses import dataclass, field
+
+
+@dataclass
+class AugmentConfig:
+    """Controls which augmentations are active and their intensities.
+
+    All probabilities (p_*) are per-sample and independent.
+    Disable individual augmentations by setting their probability to 0.
+    """
+    p_gaussian_noise: float = 0.3   # probability of adding Gaussian noise
+    noise_std: float = 10.0         # noise standard deviation (0-255 scale)
+
+    p_blur: float = 0.2             # probability of Gaussian blur
+    blur_radius: float = 1.2        # blur kernel radius in pixels
+
+    p_jpeg: float = 0.3             # probability of JPEG compression artifact
+    jpeg_quality_min: int = 40      # lowest JPEG quality (more artifacts)
+    jpeg_quality_max: int = 80      # highest JPEG quality (fewer artifacts)
+
+    p_color_jitter: float = 0.4     # probability of color jitter
+    brightness: float = 0.3        # max brightness delta (factor in [1-d, 1+d])
+    contrast: float = 0.3          # max contrast delta
+    saturation: float = 0.4        # max saturation delta
+    hue: float = 0.03              # max hue delta (small – documents aren't colourful)
+
+    p_grayscale: float = 0.15       # probability of converting to grayscale
+    p_sharpen: float = 0.2          # probability of unsharp-mask sharpening
+    sharpen_factor: float = 1.5     # sharpening strength
+
+    p_random_erase: float = 0.15    # probability of random rectangle erasure
+    erase_max_area: float = 0.04    # maximum erased area as fraction of image
+
+
+def augment_document_image(image: "Image.Image", cfg: AugmentConfig) -> "Image.Image":
+    """Apply document-safe augmentations to a PIL RGB image.
+
+    Augmentations are applied independently and stochastically, so each call
+    produces a (potentially) different result.  The spatial content and aspect
+    ratio are never modified.
+    """
+    import io
+    import numpy as np
+    from PIL import ImageFilter, ImageEnhance
+
+    # Work on a copy so the original is unchanged
+    img = image.copy()
+
+    # 1. Gaussian noise -------------------------------------------------------
+    if _random.random() < cfg.p_gaussian_noise:
+        arr = np.array(img, dtype=np.float32)
+        noise = np.random.normal(0, cfg.noise_std, arr.shape).astype(np.float32)
+        arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+        img = Image.fromarray(arr)
+
+    # 2. Gaussian blur --------------------------------------------------------
+    if _random.random() < cfg.p_blur:
+        radius = _random.uniform(0.5, cfg.blur_radius)
+        img = img.filter(ImageFilter.GaussianBlur(radius=radius))
+
+    # 3. JPEG compression artifact --------------------------------------------
+    if _random.random() < cfg.p_jpeg:
+        quality = _random.randint(cfg.jpeg_quality_min, cfg.jpeg_quality_max)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        buf.seek(0)
+        img = Image.open(buf).convert("RGB")
+
+    # 4. Color jitter (brightness / contrast / saturation / hue) -------------
+    if _random.random() < cfg.p_color_jitter:
+        if cfg.brightness > 0:
+            factor = _random.uniform(1 - cfg.brightness, 1 + cfg.brightness)
+            img = ImageEnhance.Brightness(img).enhance(factor)
+        if cfg.contrast > 0:
+            factor = _random.uniform(1 - cfg.contrast, 1 + cfg.contrast)
+            img = ImageEnhance.Contrast(img).enhance(factor)
+        if cfg.saturation > 0:
+            factor = _random.uniform(1 - cfg.saturation, 1 + cfg.saturation)
+            img = ImageEnhance.Color(img).enhance(factor)
+        if cfg.hue > 0:
+            # PIL has no direct hue control; use HSV via numpy
+            arr = np.array(img, dtype=np.float32) / 255.0
+            # Shift hue by adding a small constant in the red channel difference
+            hue_shift = _random.uniform(-cfg.hue, cfg.hue) * 255
+            arr[:, :, 0] = np.clip(arr[:, :, 0] * 255 + hue_shift, 0, 255) / 255
+            img = Image.fromarray((arr * 255).astype(np.uint8))
+
+    # 5. Grayscale ------------------------------------------------------------
+    if _random.random() < cfg.p_grayscale:
+        img = img.convert("L").convert("RGB")
+
+    # 6. Sharpening -----------------------------------------------------------
+    if _random.random() < cfg.p_sharpen:
+        img = img.filter(ImageFilter.UnsharpMask(
+            radius=2, percent=int(cfg.sharpen_factor * 100), threshold=3
+        ))
+
+    # 7. Random rectangle erasure ---------------------------------------------
+    if _random.random() < cfg.p_random_erase:
+        w, h = img.size
+        max_area = cfg.erase_max_area * w * h
+        ew = _random.randint(1, max(1, int((max_area ** 0.5))))
+        eh = _random.randint(1, max(1, int(max_area / max(ew, 1))))
+        ew, eh = min(ew, w), min(eh, h)
+        x0 = _random.randint(0, w - ew)
+        y0 = _random.randint(0, h - eh)
+        arr = np.array(img)
+        arr[y0:y0 + eh, x0:x0 + ew] = 0  # black rectangle
+        img = Image.fromarray(arr)
+
+    return img
+
 class DocTagDataset(Dataset):
     """
     Loads (image_path, doctag_string) pairs from a JSONL file and returns
@@ -152,7 +279,8 @@ class DocTagDataset(Dataset):
     is computed only on the assistant's DocTag output.
     """
 
-    def __init__(self, jsonl_path: str, processor, max_length: int = 1024):
+    def __init__(self, jsonl_path: str, processor, max_length: int = 1024,
+                 augment_cfg: "AugmentConfig | None" = None):
         self.records: list[dict] = []
         with open(jsonl_path, encoding="utf-8") as f:
             for line in f:
@@ -161,6 +289,7 @@ class DocTagDataset(Dataset):
                     self.records.append(json.loads(line))
         self.processor = processor
         self.max_length = max_length
+        self.augment_cfg = augment_cfg  # None = no augmentation (used for val)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -169,7 +298,12 @@ class DocTagDataset(Dataset):
         record = self.records[idx]
         image = Image.open(record["image"]).convert("RGB")
         doctag = record["doctag"]
-        
+        # Idefics processors count literal "<image>" tokens in text as image placeholders.
+        # Some datasets use <image>...</image> as a structural tag, so normalise it
+        # to <picture>...</picture> (DocTag-compatible) before tokenisation.
+        doctag = doctag.replace("<image>", "<picture>").replace("</image>", "</picture>")
+        if self.augment_cfg is not None:
+            image = augment_document_image(image, self.augment_cfg)
         # --- build full conversation (prompt + response) ---
         messages_full = [
             {
@@ -211,14 +345,31 @@ class DocTagDataset(Dataset):
         ).input_ids
 
         # Full pass: include the image so pixel_values are produced correctly
-        inputs = self.processor(
-            images=image,
-            text=text_full,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
-        )
-        image.close()
+        try:
+            inputs = self.processor(
+                images=image,
+                text=text_full,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
+            )
+        except ValueError as exc:
+            if "number of images" not in str(exc):
+                raise
+            # Fallback: if extra <image> placeholders remain in text, repeat the same
+            # page image so processor receives a matching image count.
+            image_token_count = text_full.count("<image>")
+            if image_token_count <= 1:
+                raise
+            inputs = self.processor(
+                images=[image] * image_token_count,
+                text=text_full,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
+            )
+        finally:
+            image.close()
 
         # Remove the batch dimension added by the processor
         inputs = {k: v.squeeze(0) for k, v in inputs.items()}
@@ -598,6 +749,56 @@ def _plot_training_curves(history: dict, output_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Mid-epoch safety checkpoint
+# ---------------------------------------------------------------------------
+
+class MidEpochCheckpointCallback(TrainerCallback):
+    """Saves a rolling checkpoint every `save_steps` optimizer steps.
+
+    This ensures that if training stops unexpectedly (dataset error, OOM,
+    hardware failure) before the end of an epoch, the last N steps of work
+    are not lost.  Only one checkpoint is kept at a time (overwritten each
+    interval) to avoid filling disk.
+    """
+
+    def __init__(self, save_steps: int, output_dir: str) -> None:
+        self.save_steps = save_steps
+        self.checkpoint_dir = os.path.join(output_dir, "mid_epoch_checkpoint")
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> None:
+        if state.global_step > 0 and state.global_step % self.save_steps == 0:
+            trainer = kwargs.get("model")  # not available here; use control
+            control.should_save = False    # don't trigger the default save logic
+            try:
+                # Access trainer via the callback's registered trainer reference
+                _trainer = getattr(self, "_trainer", None)
+                if _trainer is not None:
+                    _trainer.save_model(self.checkpoint_dir)
+                    print(
+                        f"[Step {state.global_step}] Mid-epoch checkpoint saved → "
+                        f"{self.checkpoint_dir}"
+                    )
+            except Exception as exc:
+                print(f"[WARNING] Could not save mid-epoch checkpoint: {exc}")
+
+    def on_train_begin(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ) -> None:
+        # Capture the trainer reference when training starts
+        self._trainer = kwargs.get("trainer")
+
+
+# ---------------------------------------------------------------------------
 # Signal / interrupt handling
 # ---------------------------------------------------------------------------
 
@@ -649,11 +850,11 @@ def main() -> None:
         default="doctag_model",
         help="Directory where the fine-tuned model is saved (default: doctag_model)",
     )
-    parser.add_argument("--epochs", type=int, default=2, help="Number of training epochs (default: 10)")
+    parser.add_argument("--epochs", type=int, default=7, help="Number of training epochs (default: 6)")
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=1,
+        default=2,
         help="Per-device training batch size (default: 1)",
     )
     parser.add_argument(
@@ -673,8 +874,8 @@ def main() -> None:
         action="store_true",
         help="Use LoRA for parameter-efficient fine-tuning (requires peft)",
     )
-    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank (default: 8)")
-    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha (default: 16)")
+    parser.add_argument("--lora_r", type=int, default=32, help="LoRA rank (default: 32)")
+    parser.add_argument("--lora_alpha", type=int, default=64, help="LoRA alpha (default: 64)")
     parser.add_argument(
         "--lora_dropout",
         type=float,
@@ -684,7 +885,7 @@ def main() -> None:
     parser.add_argument(
         "--lora_adapter_path",
         type=str,
-        default="/home/rookie/Documents/Minje/smol_docling_generator/doctag_model_prev",
+        default=None,
         help="Path to a custom LoRA adapter directory (must contain adapter_config.json). Overrides lora_r, lora_alpha, lora_dropout.",
     )
     parser.add_argument(
@@ -695,6 +896,63 @@ def main() -> None:
             "Maximum number of epoch checkpoints to keep inside --output_dir. "
             "Oldest checkpoints are deleted when the limit is exceeded. "
             "Default: None (keep all)."
+        ),
+    )
+    parser.add_argument(
+        "--mid_epoch_save_steps",
+        type=int,
+        default=200,
+        help=(
+            "Save a rolling mid-epoch checkpoint every N optimizer steps. "
+            "Protects against unexpected stops before an epoch completes. "
+            "Saved to <output_dir>/mid_epoch_checkpoint (overwritten each time). "
+            "Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--use_wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging for hyperparameters and metrics.",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="Docling fine tuning",
+        help="W&B project name (used when --use_wandb is set).",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity/team.",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default="",
+        help="Optional W&B run name. Auto-generated if empty.",
+    )
+    parser.add_argument(
+        "--wandb_tags",
+        type=str,
+        default="",
+        help="Comma-separated W&B tags, e.g. 'craft,lora,bf16'.",
+    )
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        default="online",
+        choices=["online", "offline", "disabled"],
+        help="W&B mode (online/offline/disabled).",
+    )
+    parser.add_argument(
+        "--augment",
+        action="store_true",
+        help=(
+            "Enable on-the-fly image augmentation for training samples. "
+            "Safe ops only (noise, blur, JPEG artefacts, colour jitter, "
+            "grayscale, sharpen, random erase). "
+            "Validation images are never augmented."
         ),
     )
     args = parser.parse_args()
@@ -716,7 +974,7 @@ def main() -> None:
         print("WARNING: Flash Attention 2 requires float16 or bfloat16. Pass --bf16 or --fp16.")
     model = AutoModelForImageTextToText.from_pretrained(
         args.model_id,
-        torch_dtype=torch_dtype,
+        dtype=torch_dtype,
         attn_implementation="flash_attention_2" if args.flash_attn else "eager",
     )
     # Gradient checkpointing (enabled below) is incompatible with use_cache.
@@ -770,14 +1028,70 @@ def main() -> None:
             model.print_trainable_parameters()
 
     print("Building datasets …")
-    train_dataset = DocTagDataset(args.train_data, processor, args.max_length)
+    augment_cfg = AugmentConfig() if args.augment else None
+    if augment_cfg is not None:
+        print("Image augmentation enabled for training set.")
+    train_dataset = DocTagDataset(args.train_data, processor, args.max_length,
+                                  augment_cfg=augment_cfg)
 
     val_dataset = None
     if Path(args.val_data).exists():
-        val_dataset = DocTagDataset(args.val_data, processor, args.max_length)
+        val_dataset = DocTagDataset(args.val_data, processor, args.max_length,
+                                    augment_cfg=None)  # never augment val
         print(f"Train: {len(train_dataset)} samples | Val: {len(val_dataset)} samples")
     else:
         print(f"Train: {len(train_dataset)} samples | No validation file found at {args.val_data}")
+
+    wandb_enabled = args.use_wandb and args.wandb_mode != "disabled"
+    run_name = None
+    if wandb_enabled:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise ImportError(
+                "wandb is not installed in this environment. Install it with:\n"
+                "  pip install wandb"
+            ) from exc
+
+        auto_name = (
+            f"doctag-{Path(args.train_data).stem}-"
+            f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        run_name = args.wandb_run_name.strip() or auto_name
+        tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            mode=args.wandb_mode,
+            tags=tags or None,
+        )
+        wandb.config.update(
+            {
+                "model_id": args.model_id,
+                "train_data": args.train_data,
+                "val_data": args.val_data,
+                "output_dir": args.output_dir,
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "grad_accum": args.grad_accum,
+                "lr": args.lr,
+                "max_length": args.max_length,
+                "fp16": args.fp16,
+                "bf16": args.bf16,
+                "flash_attn": args.flash_attn,
+                "freeze_vision": args.freeze_vision,
+                "lora": args.lora,
+                "lora_r": args.lora_r,
+                "lora_alpha": args.lora_alpha,
+                "lora_dropout": args.lora_dropout,
+                "save_total_limit": args.save_total_limit,
+                "train_samples": len(train_dataset),
+                "val_samples": len(val_dataset) if val_dataset is not None else 0,
+            },
+            allow_val_change=True,
+        )
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -800,7 +1114,8 @@ def main() -> None:
         greater_is_better=False,
         remove_unused_columns=False,
         dataloader_num_workers=0,
-        report_to="none",
+        report_to=["wandb"] if wandb_enabled else "none",
+        run_name=run_name,
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
         gradient_checkpointing=True,
@@ -814,6 +1129,16 @@ def main() -> None:
 
     metrics_callback = TrainingMetricsCallback(output_dir=args.output_dir)
 
+    callbacks = [EvalMemoryCallback(), metrics_callback]
+    if args.mid_epoch_save_steps > 0:
+        mid_epoch_cb = MidEpochCheckpointCallback(
+            save_steps=args.mid_epoch_save_steps,
+            output_dir=args.output_dir,
+        )
+        callbacks.append(mid_epoch_cb)
+    else:
+        mid_epoch_cb = None
+
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -822,8 +1147,12 @@ def main() -> None:
         data_collator=doctag_data_collator,
         compute_metrics=make_compute_metrics(processor.tokenizer) if val_dataset is not None else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics if val_dataset is not None else None,
-        callbacks=[EvalMemoryCallback(), metrics_callback],
+        callbacks=callbacks,
     )
+
+    # Give the mid-epoch callback a reference to the trainer so it can call save_model
+    if mid_epoch_cb is not None:
+        mid_epoch_cb._trainer = trainer
 
     # Install signal handlers (closure captures trainer, no global needed).
     _install_signal_handlers(trainer)
@@ -838,6 +1167,26 @@ def main() -> None:
         processor.save_pretrained(emergency_dir)
         print(f"Emergency checkpoint saved to {emergency_dir}")
         raise
+    finally:
+        if wandb_enabled:
+            try:
+                import wandb
+
+                history_path = os.path.join(args.output_dir, "training_history.json")
+                if os.path.exists(history_path):
+                    wandb.save(history_path, policy="now")
+
+                eval_losses = metrics_callback.history.get("eval_loss", [])
+                if eval_losses:
+                    wandb.summary["best_eval_loss"] = min(eval_losses)
+
+                train_losses = metrics_callback.history.get("train_loss", [])
+                if train_losses:
+                    wandb.summary["last_train_loss"] = train_losses[-1]
+
+                wandb.finish()
+            except Exception as exc:  # noqa: BLE001
+                print(f"W&B finalization warning: {exc}")
 
     # Save the best (or final) model to the requested output directory.
     print(f"Saving fine-tuned model to {args.output_dir}")

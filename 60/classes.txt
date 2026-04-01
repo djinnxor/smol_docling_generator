@@ -1,4 +1,0 @@
-table row
-table column
-table spanning cell
-table column header

@@ -518,7 +518,7 @@ def render_doctags(
 
     Returns the list of written file paths.
     """
-    from build_document import render_doctag as _render  # type: ignore[import-untyped]
+    from utils.build_document import render_doctag as _render  # type: ignore[import-untyped]
 
     out_dir = Path(render_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -623,7 +623,7 @@ def main() -> None:
 
     # ---- 1. Load DocTag strings ----
     if args.input:
-        from build_document import load_doctags_from_file  # type: ignore[import-untyped]
+        from utils.build_document import load_doctags_from_file  # type: ignore[import-untyped]
         source_doctags = load_doctags_from_file(args.input)
         print(f"Loaded {len(source_doctags)} DocTag(s) from {args.input}")
     else:

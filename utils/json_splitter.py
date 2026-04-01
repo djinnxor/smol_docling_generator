@@ -36,4 +36,4 @@ def split_json_file(input_file, output_train, output_test, split_ratio=0.8):
     print(f"Split {len(data)} records into {len(train_data)} for training and {len(test_data)} for testing.")
 
 if __name__ == "__main__":
-    split_json_file("/home/rookie/Documents/Minje/smol_docling_generator/all.jsonl", "/home/rookie/Documents/Minje/smol_docling_generator/train.jsonl", "/home/rookie/Documents/Minje/smol_docling_generator/test.jsonl")
+    split_json_file("/home/rookie/Documents/Minje/smol_docling_generator/only_synthetic_tables.jsonl", "/home/rookie/Documents/Minje/smol_docling_generator/table_only_synthetic_train.jsonl", "/home/rookie/Documents/Minje/smol_docling_generator/table_only_synthetic_val.jsonl")

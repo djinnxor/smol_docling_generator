@@ -38,3 +38,11 @@ custom_models/
 doctag_model_/
 doctag_model_prev.tar.xz
 labeler_data.tar.xz
+craft_doctag_model/
+craft_doctag_model_v4/
+craft_doctag_model_v4_craft_only/
+doctag_model_currently_the_best/
+doctag_model_origin/
+text_synthetic_doctag_model/
+wandb/
+table_synthetic_doctag_model/
