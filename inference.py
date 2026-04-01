@@ -30,13 +30,12 @@ python inference.py --input document.pdf --device cpu
 import argparse
 import json
 import sys
-import tempfile
 from pathlib import Path
 
 import torch
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
-from build_document import parse_doctag, render_doctag, save_output  
+from utils.build_document import parse_doctag, render_doctag, save_output  
 
 
 # Local folder produced by train.py --output_dir (preferred default)
@@ -111,7 +110,14 @@ def _load_model_and_processor(model_id: str, device: str, dtype: torch.dtype):
 
         print(f"Loading LoRA adapter from: {model_id}", file=sys.stderr)
         print(f"  base model: {base_model_id}", file=sys.stderr)
-        processor = AutoProcessor.from_pretrained(model_id)
+        # Checkpoints only contain adapter weights, not the full processor config.
+        # Try the checkpoint first (works for full fine-tune saves), then fall back
+        # to the base model (required for raw trainer checkpoints).
+        try:
+            processor = AutoProcessor.from_pretrained(model_id)
+        except (ValueError, OSError):
+            print(f"  processor not found in checkpoint, loading from base model", file=sys.stderr)
+            processor = AutoProcessor.from_pretrained(base_model_id)
         base_model = AutoModelForImageTextToText.from_pretrained(
             base_model_id, dtype=dtype
         )
@@ -201,6 +207,47 @@ def _infer_page(
 # Public API
 # -----------------------------------------------------------------------
 
+def run_inference_from_checkpoint(
+    checkpoint_path: str,
+    input_path: str,
+    output_path: str | None = None,
+    device: str = "auto",
+    dtype: torch.dtype | None = None,
+    max_new_tokens: int = 9000,
+    dpi: int = 96,
+    max_pages: int | None = None,
+) -> list[dict]:
+    """
+    Run DocTag inference using a training checkpoint directory.
+
+    *checkpoint_path* should point to a directory that contains
+    ``adapter_config.json`` and ``adapter_model.safetensors`` (e.g.
+    ``doctag_model/checkpoint-3764``).  The base model is resolved
+    automatically from ``adapter_config.json``.
+
+    All other parameters are forwarded to :func:`run_inference`.
+    """
+    checkpoint = Path(checkpoint_path)
+    if not checkpoint.is_dir():
+        raise ValueError(f"Checkpoint path is not a directory: {checkpoint_path}")
+    if not (checkpoint / "adapter_config.json").exists():
+        raise ValueError(
+            f"No adapter_config.json found in {checkpoint_path}. "
+            "Make sure this is a valid PEFT / LoRA checkpoint directory."
+        )
+    print(f"Using checkpoint: {checkpoint_path}", file=sys.stderr)
+    return run_inference(
+        input_path=input_path,
+        model_id=str(checkpoint),
+        output_path=output_path,
+        device=device,
+        dtype=dtype,
+        max_new_tokens=max_new_tokens,
+        dpi=dpi,
+        max_pages=max_pages,
+    )
+
+
 def run_inference(
     input_path: str,
     model_id: str = DEFAULT_MODEL_ID,
@@ -243,18 +290,29 @@ def run_inference(
     results: list[dict] = []
     doctags = []
     total = len(images)
+    import time
+    t0 = time.time()
+    page_times = []
     for i, img in enumerate(images, 1):
         print(f"Processing page {i}/{total} …", file=sys.stderr)
+        t_page_start = time.time()
         doctag = _infer_page(img, processor, model, device, max_new_tokens)
+        t_page_end = time.time()
+        elapsed = t_page_end - t_page_start
+        page_times.append(elapsed)
+        print(f"  Inference time: {elapsed:.2f} sec", file=sys.stderr)
         results.append({"page": i, "doctag": doctag})
         doctags.append(doctag)
+
+    t1 = time.time()
+    total_time = t1 - t0
 
     images = []
     for i, dt in enumerate(doctags):
         img = render_doctag(dt, 1240, 1754, 20)
         images.append(img)
         print(f"  Page {i + 1}: {len(parse_doctag(dt))} elements")
-    
+
     fmt = "pdf" if len(images) > 1 else "png"
     if fmt == "pdf":
         written = save_output(images, "doctag_render.pdf", fmt)
@@ -262,6 +320,7 @@ def run_inference(
         written = save_output(images, "doctag_render.png", fmt)
     for fp in written:
         print(f"  → {fp}")
+    print(f"Total inference time: {total_time:.2f} sec", file=sys.stderr)
     print("Done.")
 
     # Save / print
@@ -313,11 +372,21 @@ def main() -> None:
     )
     parser.add_argument(
         "--model_id",
-        default=DEFAULT_MODEL_ID,
+        default=None,
         help=(
             "HuggingFace model ID or path to a fine-tuned checkpoint / LoRA adapter. "
             f"Defaults to '{LOCAL_DOCTAG_MODEL}' (local trained model) when that folder "
-            f"exists, otherwise falls back to '{FALLBACK_MODEL_ID}'."
+            f"exists, otherwise falls back to '{FALLBACK_MODEL_ID}'. "
+            "Mutually exclusive with --checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help=(
+            "Path to a training checkpoint directory containing adapter_config.json "
+            "and adapter_model.safetensors (e.g. doctag_model/checkpoint-3764). "
+            "Mutually exclusive with --model_id."
         ),
     )
     parser.add_argument(
@@ -350,8 +419,8 @@ def main() -> None:
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=1536,
-        help="Maximum number of tokens to generate per page (default: 1536)",
+        default=9000,
+        help="Maximum number of tokens to generate per page (default: 9000)",
     )
     parser.add_argument(
         "--dpi",
@@ -367,6 +436,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.checkpoint and args.model_id:
+        parser.error("--checkpoint and --model_id are mutually exclusive")
+
     if not Path(args.input).exists():
         parser.error(f"Input file not found: {args.input}")
 
@@ -377,9 +449,8 @@ def main() -> None:
         else (torch.float16 if args.fp16 else None)
     )
 
-    run_inference(
+    common_kwargs = dict(
         input_path=args.input,
-        model_id=args.model_id,
         output_path=args.output,
         device=args.device,
         dtype=dtype,
@@ -387,6 +458,11 @@ def main() -> None:
         dpi=args.dpi,
         max_pages=args.pages,
     )
+
+    if args.checkpoint:
+        run_inference_from_checkpoint(checkpoint_path=args.checkpoint, **common_kwargs)
+    else:
+        run_inference(model_id=args.model_id or DEFAULT_MODEL_ID, **common_kwargs)
 
 
 if __name__ == "__main__":
