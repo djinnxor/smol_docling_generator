@@ -5,6 +5,12 @@ Usage:
                     --lora                                 \\
                     --bf16                                 \\
                     --output_dir doctag_model
+
+    # Resume from a specific checkpoint:
+    python train.py ... --resume_from_checkpoint doctag_model/checkpoint-500
+
+    # Resume from the latest checkpoint automatically:
+    python train.py ... --resume_from_checkpoint last --output_dir doctag_model
 """
 
 import argparse
@@ -955,6 +961,16 @@ def main() -> None:
             "Validation images are never augmented."
         ),
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to a checkpoint directory to resume training from, or 'last' "
+            "to automatically resume from the latest checkpoint in --output_dir. "
+            "Restores model weights, optimizer state, scheduler, and global step."
+        ),
+    )
     args = parser.parse_args()
 
     if not Path(args.train_data).exists():
@@ -1157,9 +1173,30 @@ def main() -> None:
     # Install signal handlers (closure captures trainer, no global needed).
     _install_signal_handlers(trainer)
 
+    # Resolve 'last' keyword to the most recent checkpoint in output_dir.
+    resume_checkpoint = args.resume_from_checkpoint
+    if resume_checkpoint is not None and resume_checkpoint.lower() == "last":
+        from transformers.trainer_utils import get_last_checkpoint
+        last_ckpt = get_last_checkpoint(args.output_dir)
+        if last_ckpt is None:
+            print(
+                f"WARNING: --resume_from_checkpoint=last specified but no checkpoint "
+                f"found in {args.output_dir!r}.  Starting from scratch."
+            )
+            resume_checkpoint = None
+        else:
+            resume_checkpoint = last_ckpt
+            print(f"Resuming from latest checkpoint: {resume_checkpoint}")
+    elif resume_checkpoint is not None:
+        if not os.path.isdir(resume_checkpoint):
+            raise FileNotFoundError(
+                f"Checkpoint directory not found: {resume_checkpoint}"
+            )
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
+
     print("Starting training …")
     try:
-        trainer.train()
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.  Saving emergency checkpoint …")
         emergency_dir = os.path.join(args.output_dir, "emergency_checkpoint")

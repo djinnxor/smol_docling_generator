@@ -175,7 +175,13 @@ def _tree_edit_dist(pred: str, ref: str) -> float:
 # ---------------------------------------------------------------------------
 
 class DocTagDataset(Dataset):
-    def __init__(self, jsonl_path: str, processor, max_length: int = 4096):
+    def __init__(
+        self,
+        jsonl_path: str,
+        processor,
+        max_length: int = 4096,
+        max_image_edge: int = 1024,
+    ):
         self.records: list[dict] = []
         with open(jsonl_path, encoding="utf-8") as f:
             for line in f:
@@ -184,6 +190,7 @@ class DocTagDataset(Dataset):
                     self.records.append(json.loads(line))
         self.processor = processor
         self.max_length = max_length
+        self.max_image_edge = max_image_edge
 
     def __len__(self) -> int:
         return len(self.records)
@@ -191,6 +198,9 @@ class DocTagDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         record = self.records[idx]
         image = Image.open(record["image"]).convert("RGB")
+        if self.max_image_edge > 0 and max(image.size) > self.max_image_edge:
+            resampling = getattr(Image, "Resampling", Image)
+            image.thumbnail((self.max_image_edge, self.max_image_edge), resampling.LANCZOS)
         doctag = record["doctag"]
         # Normalize <image>/<image_caption> tags to <picture> so the processor
         # doesn't count them as additional image placeholders.
@@ -215,6 +225,7 @@ class DocTagDataset(Dataset):
         inputs = self.processor(
             images=image, text=text_full, return_tensors="pt",
             truncation=True, max_length=self.max_length,
+            size={"longest_edge": min(max(image.size), self.max_image_edge)} if self.max_image_edge > 0 else None,
         )
         image.close()
 
@@ -331,6 +342,12 @@ def main() -> None:
     parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--max_length", type=int, default=8192)
+    parser.add_argument(
+        "--max_image_edge",
+        type=int,
+        default=1024,
+        help="Cap images to this longest edge before processing; also prevents processor upscaling small images.",
+    )
     # LoRA / DoRA
     parser.add_argument("--lora_r", type=int, default=16,
                         help="LoRA rank. 32 works well for DoRA; lower (16) if VRAM is tight.")
@@ -351,9 +368,9 @@ def main() -> None:
     parser.add_argument("--freeze_vision", action="store_true",
                         help="Freeze vision encoder; only the language decoder trains.")
     # Eval / save
-    parser.add_argument("--eval_steps", type=int, default=100,
+    parser.add_argument("--eval_steps", type=int, default=200,
                         help="Run eval every N optimizer steps. ~10%% of steps-per-epoch is a good target.")
-    parser.add_argument("--save_steps", type=int, default=100)
+    parser.add_argument("--save_steps", type=int, default=200)
     parser.add_argument("--save_total_limit", type=int, default=2)
     # W&B
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging.")
@@ -462,10 +479,20 @@ def main() -> None:
 
     # --- Datasets ---
     print("Building datasets …")
-    train_dataset = DocTagDataset(args.train_data, processor, args.max_length)
+    train_dataset = DocTagDataset(
+        args.train_data,
+        processor,
+        args.max_length,
+        args.max_image_edge,
+    )
     val_dataset = None
     if Path(args.val_data).exists():
-        val_dataset = DocTagDataset(args.val_data, processor, args.max_length)
+        val_dataset = DocTagDataset(
+            args.val_data,
+            processor,
+            args.max_length,
+            args.max_image_edge,
+        )
         print(f"Train: {len(train_dataset)} samples  |  Val: {len(val_dataset)} samples")
     else:
         print(f"Train: {len(train_dataset)} samples  |  No val file at {args.val_data}")

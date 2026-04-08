@@ -174,8 +174,9 @@ class DocTagDataset(Dataset):
         record = self.records[idx]
         image = Image.open(record["image"]).convert("RGB")
         doctag = record["doctag"]
-
-        # --- build full conversation (prompt + response) ---
+        # Normalise <image>...</image> structural tags to <picture>...</picture>
+        # so the processor does not mistake them for image placeholders.
+        doctag = doctag.replace("<image>", "<picture>").replace("</image>", "</picture>")
         messages_full = [
             {
                 "role": "user",
@@ -216,13 +217,30 @@ class DocTagDataset(Dataset):
         ).input_ids
 
         # Full pass: include the image so pixel_values are produced correctly
-        inputs = self.processor(
-            images=image,
-            text=text_full,
-            return_tensors="pt",
-            truncation=False,
-            max_length=self.max_length,
-        )
+        try:
+            inputs = self.processor(
+                images=image,
+                text=text_full,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
+            )
+        except ValueError as exc:
+            if "number of images" not in str(exc):
+                raise
+            # Fallback: repeat the single page image to match the placeholder count.
+            image_token_count = text_full.count("<image>")
+            if image_token_count <= 1:
+                raise
+            inputs = self.processor(
+                images=[image] * image_token_count,
+                text=text_full,
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
+            )
+        finally:
+            image.close()
 
         # Remove the batch dimension added by the processor
         inputs = {k: v.squeeze(0) for k, v in inputs.items()}
@@ -474,7 +492,7 @@ def main() -> None:
         help="Gradient accumulation steps (default: 2)",
     )
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (default: 2e-5)")
-    parser.add_argument("--max_length", type=int, default=1024, help="Maximum token length (default: 1024)")
+    parser.add_argument("--max_length", type=int, default=2048, help="Maximum token length (default: 2048)")
     parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (recommended)")
     parser.add_argument(
@@ -482,13 +500,29 @@ def main() -> None:
         action="store_true",
         help="Use LoRA for parameter-efficient fine-tuning (requires peft)",
     )
-    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank (default: 16)")
+    parser.add_argument("--lora_r", type=int, default=32, help="LoRA rank (default: 16)")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha (default: 32)")
     parser.add_argument(
         "--lora_dropout",
         type=float,
         default=0.05,
         help="LoRA dropout probability (default: 0.05)",
+    )
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb_project", type=str, default="Docling finetune", help="W&B project name.")
+    parser.add_argument("--wandb_entity", type=str, default="", help="W&B entity (team or username).")
+    parser.add_argument("--wandb_run_name", type=str, default="", help="W&B run name (auto-generated if empty).")
+    parser.add_argument("--wandb_tags", type=str, default="", help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb_mode", type=str, default="online", help="W&B mode: online, offline, or disabled.")
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to a checkpoint directory to resume training from, or 'last' "
+            "to automatically resume from the latest checkpoint in --output_dir. "
+            "Restores model weights, optimizer state, scheduler, and global step."
+        ),
     )
     args = parser.parse_args()
 
@@ -524,12 +558,44 @@ def main() -> None:
             task_type=TaskType.CAUSAL_LM,
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
-            target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
             lora_dropout=args.lora_dropout,
             bias="none",
         )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
+
+    if args.use_wandb and args.wandb_mode != "disabled":
+        import importlib
+        if importlib.util.find_spec("wandb") is None:
+            raise ImportError("wandb is not installed. Run: pip install wandb")
+        import wandb
+        import datetime
+        run_name = args.wandb_run_name.strip() or (
+            f"doctag-{Path(args.train_data).stem}-"
+            f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+        try:
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity or None,
+                name=run_name,
+                mode=args.wandb_mode,
+                tags=tags or None,
+            )
+        except Exception as _wandb_err:
+            print(
+                f"[WARNING] wandb online init failed ({_wandb_err}). "
+                "Falling back to offline mode. Run `wandb sync` later to upload."
+            )
+            wandb.init(
+                project=args.wandb_project,
+                name=run_name,
+                mode="offline",
+                tags=tags or None,
+            )
 
     print("Building datasets …")
     train_dataset = DocTagDataset(args.train_data, processor, args.max_length)
@@ -551,16 +617,17 @@ def main() -> None:
         fp16=args.fp16,
         bf16=args.bf16,
         logging_steps=10,
-        save_strategy="epoch",
-        eval_strategy="epoch" if val_dataset is not None else "no",
+        save_strategy="steps",  
+        save_steps=200, 
         save_total_limit=2,
         remove_unused_columns=False,
         dataloader_num_workers=0,
-        report_to="none",
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
+        report_to="wandb" if args.use_wandb else "none",
+
     )
 
     trainer = Trainer(
@@ -575,9 +642,30 @@ def main() -> None:
 
     _install_signal_handlers(trainer)
 
+    # Resolve 'last' keyword to the most recent checkpoint in output_dir.
+    resume_checkpoint = args.resume_from_checkpoint
+    if resume_checkpoint is not None and resume_checkpoint.lower() == "last":
+        from transformers.trainer_utils import get_last_checkpoint
+        last_ckpt = get_last_checkpoint(args.output_dir)
+        if last_ckpt is None:
+            print(
+                f"WARNING: --resume_from_checkpoint=last specified but no checkpoint "
+                f"found in {args.output_dir!r}.  Starting from scratch."
+            )
+            resume_checkpoint = None
+        else:
+            resume_checkpoint = last_ckpt
+            print(f"Resuming from latest checkpoint: {resume_checkpoint}")
+    elif resume_checkpoint is not None:
+        if not os.path.isdir(resume_checkpoint):
+            raise FileNotFoundError(
+                f"Checkpoint directory not found: {resume_checkpoint}"
+            )
+        print(f"Resuming from checkpoint: {resume_checkpoint}")
+
     print("Starting training …")
     try:
-        trainer.train()
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.  Saving emergency checkpoint …")
         emergency_dir = os.path.join(args.output_dir, "emergency_checkpoint")

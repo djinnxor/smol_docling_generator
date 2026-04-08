@@ -148,8 +148,11 @@ def xml_to_doctag_pairs(xml_path: str, images_dir: str):
     Parse a single XML annotation file and yield (image_path, doctag_string) pairs,
     one per page that has a matching image file.
     """
+    import sys
     tree = ET.parse(xml_path)
     root = tree.getroot()
+    from pathlib import Path
+    xml_file_stem = Path(xml_path).stem
 
     # Support two XML layouts produced by export_xml:
     #   1. <page> as root (one file per page – the common labeler output)
@@ -161,7 +164,7 @@ def xml_to_doctag_pairs(xml_path: str, images_dir: str):
 
     for page in pages:
         page_num = page.get("num", "1")
-        image_stem = page.get("image", "")
+        image_stem = xml_file_stem
 
         # Locate the page image
         image_path = None
@@ -170,7 +173,14 @@ def xml_to_doctag_pairs(xml_path: str, images_dir: str):
             if candidate.exists():
                 image_path = str(candidate)
                 break
-
+        # If not found, try searching in a subfolder ending with '_aug2'
+        if image_path is None:
+            aug2_dir = Path(images_dir) / f"{image_stem}_aug2"
+            for ext in IMAGE_EXTENSIONS:
+                candidate = aug2_dir / f"{image_stem}{ext}"
+                if candidate.exists():
+                    image_path = str(candidate)
+                    break
         if image_path is None:
             continue
 
@@ -179,7 +189,6 @@ def xml_to_doctag_pairs(xml_path: str, images_dir: str):
         for child in page:
             tag = child.tag
             doctag_tag = LABEL_TO_DOCTAG.get(tag, tag)
-
             try:
                 x1 = float(child.get("bbox_x1", 0))
                 y1 = float(child.get("bbox_y1", 0))
@@ -187,20 +196,15 @@ def xml_to_doctag_pairs(xml_path: str, images_dir: str):
                 y2 = float(child.get("bbox_y2", 1))
             except (TypeError, ValueError):
                 continue
-
             lx1, ly1, lx2, ly2 = _bbox_to_loc(x1, y1, x2, y2)
-
             # For tables, pass the full XML string (including children)
             if doctag_tag == "otsl":
                 content = ET.tostring(child, encoding="unicode")
             else:
                 content = (child.text or "").strip()
-
             element_strings.append(_element_to_doctag(doctag_tag, lx1, ly1, lx2, ly2, content))
-
         if not element_strings:
             continue
-
         doctag_str = "<doctag>\n" + "\n".join(element_strings) + "\n</doctag>"
         yield image_path, doctag_str
 
@@ -209,7 +213,7 @@ def prepare_dataset(
     xml_dir: str,
     images_dir: str,
     output_path: str = "training_data.jsonl",
-    split_ratio: float = 0.9,
+    split_ratio: float | None = None,
 ):
     """
     Process all XML annotation files in xml_dir, build (image, doctag) pairs,
@@ -234,13 +238,18 @@ def prepare_dataset(
         print("No records found. Check that XML annotation files and page images are present.")
         return None, None
 
-    train_records, val_records = train_test_split(
-        records, test_size=1 - split_ratio, random_state=42
-    )
-    
     base = output_path.replace(".jsonl", "")
     train_path = f"{base}_train.jsonl"
     val_path = f"{base}_val.jsonl"
+
+    if split_ratio is None:
+        # No split, all data to train
+        train_records = records
+        val_records = []
+    else:
+        train_records, val_records = train_test_split(
+            records, test_size=1 - split_ratio, random_state=42
+        )
 
     with open(train_path, "w", encoding="utf-8") as f:
         for r in train_records:
@@ -255,7 +264,7 @@ def prepare_dataset(
         print(f"Saved {len(val_records)} validation record(s) to {val_path}")
     else:
         val_path = None
-        print("No validation records (dataset too small for the chosen split ratio).")
+        print("No validation records (dataset too small or no split ratio provided).")
 
     return train_path, val_path
 
@@ -533,8 +542,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--split_ratio",
         type=float,
-        default=0.8,
-        help="Fraction of data used for training; remainder goes to validation (default: 0.8)",
+        default=None,
+        nargs='?',
+        help="Fraction of data used for training; remainder goes to validation. If not set, all data goes to train.",
     )
     args = parser.parse_args()
 

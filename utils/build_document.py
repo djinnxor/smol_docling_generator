@@ -153,6 +153,7 @@ class DocElement(NamedTuple):
     content: str  # raw inner text (may contain cell tokens for otsl)
 
 
+
 # Regex that captures each element: <tag><loc_N><loc_N><loc_N><loc_N>...content...</tag>
 _ELEMENT_RE = re.compile(
     r"<(?P<tag>text|title|section_header_level_[123]|caption|picture|otsl|"
@@ -184,57 +185,77 @@ def parse_doctag(doctag: str) -> list[DocElement]:
 # ---------------------------------------------------------------------------
 
 _CELL_TOKEN_RE = re.compile(
-    r"<(ecel|ched|fcel|lcel|rhed|ucel)>"
+    r"<(ecel|ched|fcel|lcel|rhed|ucel)(\s[^>]*)?>" 
 )
 
 
-def parse_otsl(content: str) -> list[list[tuple[str, str]]]:
+
+# New: parse per-cell <loc_*> tokens for OTSL tables
+_CELL_LOC_RE = re.compile(r"<loc_(\d+)>" * 4)
+
+def parse_otsl(content: str):
     """
-    Parse OTSL cell tokens into a 2-D grid of (cell_type, text) tuples.
-
-    Tokens:
-        <nl>   = new row
-        <fcel> = data cell          <ecel> = empty cell
-        <ched> = column header      <rhed> = row header
-        <lcel> = left-merged cell   <ucel> = up-merged cell
+    Parse OTSL cell tokens into a 2-D grid of dicts with cell_type, text, colspan, rowspan, and location.
+    Each cell is expected to start with 4 <loc_*> tokens.
     """
-    rows: list[list[tuple[str, str]]] = []
-    current_row: list[tuple[str, str]] = []
-
-    # Split on cell tokens, capturing the token itself
-    parts = re.split(r"(<(?:ecel|ched|fcel|lcel|rhed|ucel|nl)>)", content)
-
-    current_type: str | None = None
+    rows = []
+    current_row = []
+    parts = re.split(r"(<(?:ecel|ched|fcel|lcel|rhed|ucel|nl)(?:\s[^>]*)?>)", content)
+    current_type = None
+    current_colspan = 1
+    current_rowspan = 1
     text_accum = ""
+    cell_loc = None
+
+    def flush_cell():
+        nonlocal text_accum, current_type, current_colspan, current_rowspan, cell_loc
+        if current_type is not None:
+            # Extract <loc_*> tokens from text_accum
+            loc_match = _CELL_LOC_RE.match(text_accum)
+            if loc_match:
+                x1, y1, x2, y2 = map(int, loc_match.groups())
+                cell_text = text_accum[loc_match.end():].strip()
+                loc = (x1, y1, x2, y2)
+            else:
+                cell_text = text_accum.strip()
+                loc = None
+            current_row.append({
+                "type": current_type,
+                "text": cell_text,
+                "colspan": current_colspan,
+                "rowspan": current_rowspan,
+                "loc": loc,
+            })
+            current_type = None
+            text_accum = ""
+            current_colspan = 1
+            current_rowspan = 1
+            cell_loc = None
 
     for part in parts:
         part = part.strip()
         if not part:
             continue
         if part == "<nl>":
-            # Flush any pending cell
-            if current_type is not None:
-                current_row.append((current_type, text_accum.strip()))
-                current_type = None
-                text_accum = ""
+            flush_cell()
             if current_row:
                 rows.append(current_row)
                 current_row = []
-        elif _CELL_TOKEN_RE.fullmatch(part):
-            # Flush previous cell
-            if current_type is not None:
-                current_row.append((current_type, text_accum.strip()))
-                text_accum = ""
-            current_type = part[1:-1]  # strip < >
         else:
-            text_accum += part
-
-    # Flush remaining
-    if current_type is not None:
-        current_row.append((current_type, text_accum.strip()))
+            m = _CELL_TOKEN_RE.fullmatch(part)
+            if m:
+                flush_cell()
+                current_type = m.group(1)
+                attrs_str = m.group(2) or ""
+                cspan_m = re.search(r'cspan\s*=\s*["\']?(\d+)["\']?', attrs_str)
+                rspan_m = re.search(r'rspan\s*=\s*["\']?(\d+)["\']?', attrs_str)
+                current_colspan = int(cspan_m.group(1)) if cspan_m else 1
+                current_rowspan = int(rspan_m.group(1)) if rspan_m else 1
+            else:
+                text_accum += part
+    flush_cell()
     if current_row:
         rows.append(current_row)
-
     return rows
 
 
@@ -361,78 +382,55 @@ def _draw_table(
 
     rows = parse_otsl(elem.content)
     if not rows:
-        # Fallback: just draw the bounding rectangle
         draw.rectangle([px1, py1, px2, py2], outline=TABLE_LINE_COLOUR, width=1)
         return
-
-    num_rows = len(rows)
-    num_cols = max(len(r) for r in rows) if rows else 1
-    table_w = px2 - px1
-    table_h = py2 - py1
-    col_w = table_w / num_cols if num_cols else table_w
-    row_h = table_h / num_rows if num_rows else table_h
 
     font_size = max(8, int(FONT_SIZES["table_cell"] * page_h / 1754))
     font = get_font(font_size)
     bold_font = get_bold_font(font_size)
 
-    # --- Build a normalised grid (pad short rows with ecel) ---
-    grid: list[list[tuple[str, str]]] = []
-    for row in rows:
-        padded = list(row) + [("ecel", "")] * (num_cols - len(row))
-        grid.append(padded[:num_cols])
+    # Build a grid to track merged cells
+    num_rows = len(rows)
+    num_cols = max(len(r) for r in rows) if rows else 0
+    cell_drawn = [[False for _ in range(num_cols)] for _ in range(num_rows)]
 
-    # --- Compute span (colspan, rowspan) for each content cell ---
-    # span_map[ri][ci] = (colspan, rowspan) for content cells, None for merged cells
-    span_map: list[list[tuple[int, int] | None]] = [
-        [None] * num_cols for _ in range(num_rows)
-    ]
-
-    for ri in range(num_rows):
-        for ci in range(num_cols):
-            cell_type, _ = grid[ri][ci]
+    for ri, row in enumerate(rows):
+        for ci, cell in enumerate(row):
+            if cell_drawn[ri][ci]:
+                continue  # already covered by a merge
+            cell_type = cell["type"]
+            cell_text = cell["text"]
+            loc = cell["loc"]
+            colspan = cell.get("colspan", 1)
+            rowspan = cell.get("rowspan", 1)
+            # Skip merged cells (lcel, ucel)
             if cell_type in ("lcel", "ucel"):
-                # This cell is part of a merge — mark as None
-                span_map[ri][ci] = None
                 continue
-
-            # Count colspan (consecutive lcel to the right)
-            colspan = 1
-            while ci + colspan < num_cols and grid[ri][ci + colspan][0] == "lcel":
-                colspan += 1
-
-            # Count rowspan (consecutive ucel below, across full colspan width)
-            rowspan = 1
-            while ri + rowspan < num_rows:
-                all_ucel = True
-                for dc in range(colspan):
-                    col_idx = ci + dc
-                    if col_idx < num_cols and grid[ri + rowspan][col_idx][0] == "ucel":
-                        continue
-                    all_ucel = False
-                    break
-                if all_ucel:
-                    rowspan += 1
+            # Find the merged area if colspan/rowspan > 1
+            if loc:
+                # Expand to cover all merged cells
+                end_ri = ri + rowspan - 1
+                end_ci = ci + colspan - 1
+                # Use the loc of the top-left and bottom-right cells
+                start_loc = loc
+                end_loc = loc
+                if rowspan > 1 or colspan > 1:
+                    # Find the bottom-right cell's loc
+                    for rj in range(ri, ri + rowspan):
+                        for cj in range(ci, ci + colspan):
+                            if rj < num_rows and cj < len(rows[rj]):
+                                cell_drawn[rj][cj] = True
+                                candidate = rows[rj][cj].get("loc")
+                                if candidate:
+                                    end_loc = candidate
                 else:
-                    break
-
-            span_map[ri][ci] = (colspan, rowspan)
-
-    # --- Draw cells ---
-    for ri in range(num_rows):
-        for ci in range(num_cols):
-            span = span_map[ri][ci]
-            if span is None:
-                # Merged cell — skip (drawn as part of the origin cell)
+                    cell_drawn[ri][ci] = True
+                cx1 = _loc_to_px(start_loc[0], page_w, margin)
+                cy1 = _loc_to_px(start_loc[1], page_h, margin)
+                cx2 = _loc_to_px(end_loc[2], page_w, margin)
+                cy2 = _loc_to_px(end_loc[3], page_h, margin)
+            else:
                 continue
-
-            colspan, rowspan = span
-            cell_type, cell_text = grid[ri][ci]
-
-            cx1 = px1 + int(ci * col_w)
-            cy1 = py1 + int(ri * row_h)
-            cx2 = px1 + int((ci + colspan) * col_w)
-            cy2 = py1 + int((ri + rowspan) * row_h)
 
             # Background for header cells
             if cell_type in ("ched", "rhed"):
@@ -444,13 +442,11 @@ def _draw_table(
             # Cell text
             if cell_text:
                 cell_content_w = cx2 - cx1 - 6
-                cell_content_h = cy2 - cy1
                 cfont = bold_font if cell_type in ("ched", "rhed") else font
                 lines = _wrap_text(cell_text, cfont, max(cell_content_w, 10))
                 ty = cy1 + 3
                 for line in lines:
                     if ty + font_size + 2 > cy2:
-                        # Draw truncation indicator
                         draw.text((cx1 + 3, ty - font_size), "…", fill=TEXT_COLOUR, font=cfont)
                         break
                     draw.text((cx1 + 3, ty), line, fill=TEXT_COLOUR, font=cfont)
@@ -458,16 +454,6 @@ def _draw_table(
 
     # Outer border (thicker)
     draw.rectangle([px1, py1, px2, py2], outline=TABLE_LINE_COLOUR, width=2)
-
-    # --- Draw grid lines explicitly for visual clarity ---
-    # Horizontal lines
-    for ri in range(1, num_rows):
-        y = py1 + int(ri * row_h)
-        draw.line([(px1, y), (px2, y)], fill=TABLE_LINE_COLOUR, width=1)
-    # Vertical lines
-    for ci in range(1, num_cols):
-        x = px1 + int(ci * col_w)
-        draw.line([(x, py1), (x, py2)], fill=TABLE_LINE_COLOUR, width=1)
 
 
 # ---------------------------------------------------------------------------

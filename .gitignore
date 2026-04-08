@@ -46,3 +46,9 @@ doctag_model_origin/
 text_synthetic_doctag_model/
 wandb/
 table_synthetic_doctag_model/
+augmented_uploads/
+doctag_model_v5/
+mix_synth_real_9300_model/
+text_only_synth_5000/
+text_synth_fintab_labeler/
+doctag_model_origin_resume/
