@@ -1,0 +1,2 @@
+/home/rookie/Documents/Minje/smol_docling_generator/train_origin.py --train_data all_mongolian_synthetics_train.jsonl --val_data all_mongolian_synthetics_val.jsonl --lora --bf16 --output_dir doctag_model_origin_resume --use_wandb --wandb_project Docling-finetune-Origin-Resume --wandb_run_name all_synthetic_data_with_real --wandb_tags synthetic,realdata,train_origin --max_length 4096 --epoch 5 --resume_from_checkpoint doctag_model_origin/checkpoint-5400
+

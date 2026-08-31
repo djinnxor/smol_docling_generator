@@ -216,7 +216,11 @@ class DocTagDataset(Dataset):
             max_length=self.max_length,
         ).input_ids
 
-        # Full pass: include the image so pixel_values are produced correctly
+        # Full pass: include the image so pixel_values are produced correctly.
+        # Do NOT pass truncation to the processor: truncating inside the processor
+        # can remove image placeholder tokens from the text while leaving the
+        # pixel_values unchanged, causing a token-count mismatch error.
+        # Instead we truncate the 1-D token tensors manually after processing.
         try:
             inputs = self.processor(
                 images=image,
@@ -244,6 +248,11 @@ class DocTagDataset(Dataset):
 
         # Remove the batch dimension added by the processor
         inputs = {k: v.squeeze(0) for k, v in inputs.items()}
+
+        # Truncate 1-D token tensors to max_length (pixel_values are left intact)
+        # for _key in ("input_ids", "attention_mask"):
+        #     if _key in inputs and inputs[_key].dim() == 1 and inputs[_key].shape[0] > self.max_length:
+        #         inputs[_key] = inputs[_key][: self.max_length]
 
         # Build labels: mask all prompt tokens with -100
         labels = inputs["input_ids"].clone()
@@ -508,6 +517,12 @@ def main() -> None:
         default=0.05,
         help="LoRA dropout probability (default: 0.05)",
     )
+    parser.add_argument(
+        "--lora_adapter_path",
+        type=str,
+        default=None,
+        help="Path to a previously trained LoRA adapter directory (must contain adapter_config.json). Loads adapter weights with a fresh optimizer.",
+    )
     parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--wandb_project", type=str, default="Docling finetune", help="W&B project name.")
     parser.add_argument("--wandb_entity", type=str, default="", help="W&B entity (team or username).")
@@ -545,25 +560,34 @@ def main() -> None:
     # model behaves consistently during both training and evaluation.
     model.config.use_cache = False
 
-    if args.lora:
+    if args.lora or args.lora_adapter_path:
         try:
-            from peft import LoraConfig, TaskType, get_peft_model
+            from peft import LoraConfig, TaskType, get_peft_model, PeftModel
         except ImportError as exc:
             raise ImportError(
                 "peft is required for LoRA fine-tuning. Install it with:\n"
                 "  pip install peft"
             ) from exc
 
-        lora_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
-            lora_dropout=args.lora_dropout,
-            bias="none",
-        )
-        model = get_peft_model(model, lora_config)
+        if args.lora_adapter_path:
+            adapter_path = Path(args.lora_adapter_path)
+            if not (adapter_path / "adapter_config.json").exists():
+                raise FileNotFoundError(
+                    f"adapter_config.json not found in {args.lora_adapter_path}"
+                )
+            print(f"Loading LoRA adapter from: {args.lora_adapter_path}")
+            model = PeftModel.from_pretrained(model, args.lora_adapter_path, is_trainable=True)
+        else:
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=args.lora_r,
+                lora_alpha=args.lora_alpha,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                "gate_proj", "up_proj", "down_proj"],
+                lora_dropout=args.lora_dropout,
+                bias="none",
+            )
+            model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
     if args.use_wandb and args.wandb_mode != "disabled":
@@ -662,6 +686,57 @@ def main() -> None:
                 f"Checkpoint directory not found: {resume_checkpoint}"
             )
         print(f"Resuming from checkpoint: {resume_checkpoint}")
+
+    # Detect stale checkpoint: if its global_step >= total training steps the
+    # HuggingFace Trainer will declare training "done" before running a single
+    # step.  When this happens, load only the model weights from the checkpoint
+    # and restart training from step 0 instead of resuming trainer state.
+    if resume_checkpoint is not None:
+        state_path = os.path.join(resume_checkpoint, "trainer_state.json")
+        if os.path.exists(state_path):
+            with open(state_path) as _f:
+                _ckpt_state = json.load(_f)
+            _ckpt_step = _ckpt_state.get("global_step", 0)
+            _steps_per_epoch = math.ceil(
+                len(train_dataset) / (args.batch_size * args.grad_accum)
+            )
+            _total_steps = _steps_per_epoch * args.epochs
+            if _ckpt_step >= _total_steps:
+                print(
+                    f"WARNING: checkpoint global_step ({_ckpt_step}) >= "
+                    f"total training steps ({_total_steps}). "
+                    "Loading model weights only and resetting training state to step 0."
+                )
+                # Load adapter weights into the already-wrapped PEFT model.
+                try:
+                    import safetensors.torch as _st
+                    _adapter_path = os.path.join(
+                        resume_checkpoint, "adapter_model.safetensors"
+                    )
+                    if os.path.exists(_adapter_path) and args.lora:
+                        from peft import set_peft_model_state_dict
+                        _sd = _st.load_file(_adapter_path)
+                        set_peft_model_state_dict(model, _sd)
+                        print(f"Loaded LoRA weights from {resume_checkpoint}")
+                    else:
+                        # Non-LoRA full model weights
+                        _model_path = os.path.join(
+                            resume_checkpoint, "model.safetensors"
+                        )
+                        if not os.path.exists(_model_path):
+                            _model_path = os.path.join(
+                                resume_checkpoint, "pytorch_model.bin"
+                            )
+                        if os.path.exists(_model_path):
+                            if _model_path.endswith(".bin"):
+                                _sd = torch.load(_model_path, map_location="cpu")
+                            else:
+                                _sd = _st.load_file(_model_path)
+                            model.load_state_dict(_sd, strict=False)
+                            print(f"Loaded model weights from {resume_checkpoint}")
+                except Exception as _load_err:
+                    print(f"WARNING: could not load weights from checkpoint: {_load_err}")
+                resume_checkpoint = None  # do not hand stale state to Trainer
 
     print("Starting training …")
     try:

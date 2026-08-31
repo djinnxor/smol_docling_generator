@@ -1,12 +1,13 @@
 import argparse
 import json
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoProcessor, AutoTokenizer, AutoModelForCausalLM
 import torch
 
 
 def compute_token_stats(jsonl_path, model_id, adapter_path=None, field="doctag", batch_size=16, max_samples=None):
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    processor = AutoProcessor.from_pretrained(args.model_id)
     # For token statistics, only the tokenizer is needed. Adapter/model loading is not required.
 
     counts = []
@@ -29,6 +30,7 @@ def compute_token_stats(jsonl_path, model_id, adapter_path=None, field="doctag",
     print(f"  Median: {sorted(counts)[len(counts)//2]}")
     print(f"  95th percentile: {sorted(counts)[int(len(counts)*0.95)]}")
     print(f"  99th percentile: {sorted(counts)[int(len(counts)*0.99)]}")
+    print(processor.image_processor)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute token statistics for a dataset using a (finetuned) tokenizer.")

@@ -180,6 +180,39 @@ def parse_doctag(doctag: str) -> list[DocElement]:
     return elements
 
 
+# Permissive element regex: ANY tag name immediately followed by 4 <loc_*>
+# tokens.  This matches the standard document tags (text, otsl, …) as well as
+# the custom ID-card field tags emitted by the ID model (register_number,
+# gender, familyname, surname, name, birthday, …).  The <doctag> wrapper is not
+# matched because it is not followed by location tokens.
+_ANY_ELEMENT_RE = re.compile(
+    r"<(?P<tag>[A-Za-z_][\w-]*)>"
+    r"<loc_(?P<x1>\d+)><loc_(?P<y1>\d+)><loc_(?P<x2>\d+)><loc_(?P<y2>\d+)>"
+    r"(?P<content>.*?)"
+    r"</(?P=tag)>",
+    re.DOTALL,
+)
+
+
+def parse_doctag_elements(doctag: str) -> list[DocElement]:
+    """Parse any positioned ``<tag><loc>…<loc>…</tag>`` element.
+
+    Unlike :func:`parse_doctag`, this is not limited to the standard document
+    element types, so it also captures custom ID-card field tags.
+    """
+    elements: list[DocElement] = []
+    for m in _ANY_ELEMENT_RE.finditer(doctag):
+        elements.append(DocElement(
+            tag=m.group("tag"),
+            x1=int(m.group("x1")),
+            y1=int(m.group("y1")),
+            x2=int(m.group("x2")),
+            y2=int(m.group("y2")),
+            content=m.group("content"),
+        ))
+    return elements
+
+
 # ---------------------------------------------------------------------------
 # OTSL table parser
 # ---------------------------------------------------------------------------
@@ -210,21 +243,14 @@ def parse_otsl(content: str):
     def flush_cell():
         nonlocal text_accum, current_type, current_colspan, current_rowspan, cell_loc
         if current_type is not None:
-            # Extract <loc_*> tokens from text_accum
-            loc_match = _CELL_LOC_RE.match(text_accum)
-            if loc_match:
-                x1, y1, x2, y2 = map(int, loc_match.groups())
-                cell_text = text_accum[loc_match.end():].strip()
-                loc = (x1, y1, x2, y2)
-            else:
-                cell_text = text_accum.strip()
-                loc = None
+            # Remove all <loc_*> tokens from text_accum (cell location info)
+            cell_text = re.sub(r"<loc_\d+>", "", text_accum).strip()
             current_row.append({
                 "type": current_type,
                 "text": cell_text,
                 "colspan": current_colspan,
                 "rowspan": current_rowspan,
-                "loc": loc,
+                # No cell location
             })
             current_type = None
             text_accum = ""
@@ -394,43 +420,27 @@ def _draw_table(
     num_cols = max(len(r) for r in rows) if rows else 0
     cell_drawn = [[False for _ in range(num_cols)] for _ in range(num_rows)]
 
+
+    # Compute grid cell sizes
+    if num_rows == 0 or num_cols == 0:
+        return
+    cell_width = (px2 - px1) // num_cols
+    cell_height = (py2 - py1) // num_rows
+
     for ri, row in enumerate(rows):
         for ci, cell in enumerate(row):
-            if cell_drawn[ri][ci]:
-                continue  # already covered by a merge
             cell_type = cell["type"]
             cell_text = cell["text"]
-            loc = cell["loc"]
             colspan = cell.get("colspan", 1)
             rowspan = cell.get("rowspan", 1)
             # Skip merged cells (lcel, ucel)
             if cell_type in ("lcel", "ucel"):
                 continue
-            # Find the merged area if colspan/rowspan > 1
-            if loc:
-                # Expand to cover all merged cells
-                end_ri = ri + rowspan - 1
-                end_ci = ci + colspan - 1
-                # Use the loc of the top-left and bottom-right cells
-                start_loc = loc
-                end_loc = loc
-                if rowspan > 1 or colspan > 1:
-                    # Find the bottom-right cell's loc
-                    for rj in range(ri, ri + rowspan):
-                        for cj in range(ci, ci + colspan):
-                            if rj < num_rows and cj < len(rows[rj]):
-                                cell_drawn[rj][cj] = True
-                                candidate = rows[rj][cj].get("loc")
-                                if candidate:
-                                    end_loc = candidate
-                else:
-                    cell_drawn[ri][ci] = True
-                cx1 = _loc_to_px(start_loc[0], page_w, margin)
-                cy1 = _loc_to_px(start_loc[1], page_h, margin)
-                cx2 = _loc_to_px(end_loc[2], page_w, margin)
-                cy2 = _loc_to_px(end_loc[3], page_h, margin)
-            else:
-                continue
+            # Compute cell bounding box
+            cx1 = px1 + ci * cell_width
+            cy1 = py1 + ri * cell_height
+            cx2 = cx1 + cell_width * colspan
+            cy2 = cy1 + cell_height * rowspan
 
             # Background for header cells
             if cell_type in ("ched", "rhed"):
@@ -451,6 +461,9 @@ def _draw_table(
                         break
                     draw.text((cx1 + 3, ty), line, fill=TEXT_COLOUR, font=cfont)
                     ty += font_size + 2
+
+    # Outer border (thicker)
+    draw.rectangle([px1, py1, px2, py2], outline=TABLE_LINE_COLOUR, width=2)
 
     # Outer border (thicker)
     draw.rectangle([px1, py1, px2, py2], outline=TABLE_LINE_COLOUR, width=2)
@@ -481,6 +494,125 @@ def render_doctag(
             _draw_table(draw, elem, page_w, page_h, margin)
         else:
             _draw_text_element(draw, elem, page_w, page_h, margin)
+
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Overlay rendering (draw boxes + text on top of a real image)
+# ---------------------------------------------------------------------------
+
+# Overlay colours
+ID_BOX_COLOUR = (0, 180, 0)        # YOLO ID detection box (green)
+ELEM_BOX_COLOUR = (220, 30, 30)    # DocTag element box (red)
+OVERLAY_TEXT_COLOUR = (10, 40, 200)  # rendered content text (blue)
+LABEL_BG_COLOUR = (255, 255, 255)  # background strip behind text for legibility
+
+
+def _clean_content(tag: str, content: str) -> str:
+    """Return human-readable text for an element, stripping markup tokens."""
+    if tag == "otsl":
+        # Flatten table cells into a single space-joined string.
+        rows = parse_otsl(content)
+        cells = [c["text"] for r in rows for c in r if c.get("text")]
+        return " | ".join(cells)
+    # Drop any stray location tokens, collapse whitespace.
+    text = re.sub(r"<loc_\d+>", "", content)
+    text = re.sub(r"<[^>]+>", "", text)
+    return " ".join(text.split())
+
+
+def _draw_label(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    font,
+    max_width: int,
+    text_colour=OVERLAY_TEXT_COLOUR,
+    anchor: str = "lt",
+) -> None:
+    """Draw wrapped *text* at *xy* on top of a white strip for readability.
+
+    *anchor* controls how *xy* is interpreted:
+        "lt" – *xy* is the top-left corner, text grows to the right (default)
+        "rt" – *xy* is the top-right corner, each line is right-aligned to it
+    """
+    if not text:
+        return
+    lines = _wrap_text(text, font, max(max_width, 40))
+    x, y = xy
+    ascent, descent = font.getmetrics()
+    line_h = ascent + descent + 2
+    for line in lines:
+        bbox = font.getbbox(line)
+        w = bbox[2] - bbox[0]
+        if anchor == "rt":
+            x0 = x - w - 4
+            draw.rectangle([x0, y, x, y + line_h], fill=LABEL_BG_COLOUR)
+            draw.text((x0 + 2, y), line, fill=text_colour, font=font)
+        else:
+            draw.rectangle([x, y, x + w + 4, y + line_h], fill=LABEL_BG_COLOUR)
+            draw.text((x + 2, y), line, fill=text_colour, font=font)
+        y += line_h
+
+
+def draw_doctag_overlay(
+    base_image: Image.Image,
+    doctag: str,
+    region: tuple[int, int, int, int] | None = None,
+    id_box: tuple[int, int, int, int] | None = None,
+    show_text: bool = True,
+) -> Image.Image:
+    """Draw DocTag element boxes (+ their text) and the ID box on *base_image*.
+
+    DocTag ``<loc_*>`` tokens use a 0-500 coordinate range relative to the
+    image the model actually saw — here that is the cropped ID region. They are
+    mapped into *region* ``(x1, y1, x2, y2)`` (the crop's location inside
+    *base_image*); if *region* is omitted the whole image is used.
+
+    *id_box* is the YOLO detection rectangle to outline in green.
+    """
+    img = base_image.convert("RGB").copy()
+    draw = ImageDraw.Draw(img)
+
+    iw, ih = img.size
+    rx1, ry1, rx2, ry2 = region if region is not None else (0, 0, iw, ih)
+    rw = max(rx2 - rx1, 1)
+    rh = max(ry2 - ry1, 1)
+
+    # Fonts scaled to the region size so labels stay readable. The content
+    # (Mongolian text) is drawn noticeably larger than the small tag-name label.
+    text_size = max(22, int(30 * rh / 1754))
+    label_size = max(13, int(16 * rh / 1754))
+    font = get_font(text_size)
+    label_font = get_font(label_size)
+
+    # ID detection box (green).
+    if id_box is not None:
+        draw.rectangle(list(id_box), outline=ID_BOX_COLOUR, width=3)
+        _draw_label(draw, (id_box[0] + 3, max(0, id_box[1] - label_size - 4)),
+                    "ID", label_font, rw, text_colour=ID_BOX_COLOUR)
+
+    # DocTag element boxes (red) + Mongolian text (blue). Use the permissive
+    # parser so custom ID-card field tags are captured, not just the standard
+    # document element types.
+    for elem in parse_doctag_elements(doctag):
+        ex1 = rx1 + int(elem.x1 / LOC_SCALE * rw)
+        ey1 = ry1 + int(elem.y1 / LOC_SCALE * rh)
+        ex2 = rx1 + int(elem.x2 / LOC_SCALE * rw)
+        ey2 = ry1 + int(elem.y2 / LOC_SCALE * rh)
+        draw.rectangle([ex1, ey1, ex2, ey2], outline=ELEM_BOX_COLOUR, width=2)
+
+        # Tag name just outside the top-left corner.
+        _draw_label(draw, (ex1, max(0, ey1 - label_size - 3)),
+                    elem.tag, label_font, ex2 - ex1, text_colour=ELEM_BOX_COLOUR)
+
+        # Mongolian text at the upper-right corner of the box, right-aligned to
+        # the box's right edge so it reads outward from the corner.
+        if show_text:
+            content = _clean_content(elem.tag, elem.content)
+            _draw_label(draw, (ex2, ey1 + 2), content, font, ex2 - ex1,
+                        anchor="rt")
 
     return img
 

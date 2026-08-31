@@ -3,27 +3,16 @@ Run DocTag inference on an image file or a PDF file using the locally trained
 model in the doctag_model/ folder (LoRA fine-tune of ibm-granite/granite-docling-258M).
 If that folder is absent the upstream HuggingFace model is used as a fallback.
 
-For each input page the model is prompted with the page image and asked to
-produce a <doctag>…</doctag> string.  Results are printed to stdout by default
-and can optionally be written to a JSON or plain-text file.
 
-Usage examples
---------------
-# Single image  (uses doctag_model/ automatically)
 python inference.py --input page.png
-
-# Multi-page PDF
 python inference.py --input document.pdf
 
-# Override the model (any HuggingFace ID or local path)
 python inference.py --input document.pdf \\
                     --model_id ./my_other_model \\
                     --output results.json
 
-# Limit to the first 5 pages, use GPU
 python inference.py --input document.pdf --pages 5 --device cuda
 
-# CPU-only, mixed precision disabled
 python inference.py --input document.pdf --device cpu
 """
 
@@ -31,21 +20,124 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import tempfile
 
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from transformers import AutoModelForImageTextToText, AutoProcessor
-from utils.build_document import parse_doctag, render_doctag, save_output  
+from utils.build_document import (
+    parse_doctag,
+    render_doctag,
+    draw_doctag_overlay,
+    save_output,
+)
 
 
 # Local folder produced by train.py --output_dir (preferred default)
-LOCAL_DOCTAG_MODEL = "doctag_model"
+LOCAL_DOCTAG_MODEL = "doctag_model___"
 # Upstream model used when the local folder is absent
 FALLBACK_MODEL_ID = "ibm-granite/granite-docling-258M"
 # Resolved default: use local folder if it exists, else HuggingFace
 DEFAULT_MODEL_ID = LOCAL_DOCTAG_MODEL if Path(LOCAL_DOCTAG_MODEL).is_dir() else FALLBACK_MODEL_ID
 SYSTEM_PROMPT = "Convert this document page to DocTags format."
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+DEFAULT_YOLO_MODEL_PATH = "/home/rookie/Downloads/best.pt"
+
+
+def detect_id(image_path: str, yolo_model_path: str = DEFAULT_YOLO_MODEL_PATH) -> dict:
+    """Run YOLO ID detection on *image_path*.
+    """
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise ImportError(
+            "ultralytics is required for YOLO ID detection. Install it with:\n"
+            "  pip install ultralytics"
+        ) from exc
+
+    model = YOLO(yolo_model_path)
+    original = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+
+    angle_results: list[tuple[int, float]] = []  # (angle, best_conf)
+
+    for angle in [0, 90, 270]:
+        candidate = original.rotate(angle, expand=True)
+        detections = model(candidate, verbose=False)
+        conf = max(
+            (float(b.conf[0]) for r in detections for b in (r.boxes or [])),
+            default=0.0,
+        )
+        angle_results.append((angle, conf))
+        print(f"[YOLO] angle={angle:3d}°  conf={conf:.4f}", file=sys.stderr)
+
+    best_angle, best_conf_probe = max(angle_results, key=lambda x: x[1])
+
+    if best_angle != 0:
+        print(
+            f"[YOLO] Rotating image by {best_angle}° (conf={best_conf_probe:.4f})",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[YOLO] No rotation needed (best angle=0°, conf={best_conf_probe:.4f})",
+            file=sys.stderr,
+        )
+
+    oriented = original.rotate(best_angle, expand=True)
+
+    # ── Final detection on the best-oriented image ────────────────────────
+    final_results = model(oriented, verbose=False)
+
+    best_box = None
+    best_conf_final = -1.0
+    for result in final_results:
+        if result.boxes is None or len(result.boxes) == 0:
+            continue
+        for box in result.boxes:
+            conf = float(box.conf[0])
+            if conf > best_conf_final:
+                best_conf_final = conf
+                best_box = box
+
+    iw, ih = oriented.size
+    if best_box is None:
+        print("[YOLO] No ID detected – using EXIF-corrected original image.", file=sys.stderr)
+        return {
+            "oriented": oriented,
+            "cropped": oriented,
+            "id_box": None,
+            "crop_box": (0, 0, iw, ih),
+            "angle": best_angle,
+        }
+
+    dx1, dy1, dx2, dy2 = (int(v) for v in best_box.xyxy[0].tolist())
+
+    # Add a small margin so diagonal cards don't lose corner text
+    margin_x = int((dx2 - dx1) * 0.04)
+    margin_y = int((dy2 - dy1) * 0.04)
+    x1 = max(0, dx1 - margin_x)
+    y1 = max(0, dy1 - margin_y)
+    x2 = min(iw, dx2 + margin_x)
+    y2 = min(ih, dy2 + margin_y)
+
+    print(
+        f"[YOLO] ID detected (conf={best_conf_final:.4f}, angle={best_angle}°) – "
+        f"crop [{x1}, {y1}, {x2}, {y2}]",
+        file=sys.stderr,
+    )
+    cropped = oriented.crop((x1, y1, x2, y2))
+    return {
+        "oriented": oriented,
+        "cropped": cropped,
+        "id_box": (dx1, dy1, dx2, dy2),
+        "crop_box": (x1, y1, x2, y2),
+        "angle": best_angle,
+    }
+
+
+def detect_and_crop_id(image_path: str, yolo_model_path: str = DEFAULT_YOLO_MODEL_PATH) -> Image.Image:
+    """Backward-compatible wrapper that returns only the cropped ID image."""
+    return detect_id(image_path, yolo_model_path=yolo_model_path)["cropped"]
 
 
 def _resolve_device_dtype(device: str, dtype: torch.dtype | None) -> tuple[str, torch.dtype]:
@@ -165,8 +257,16 @@ def _infer_page(
     model,
     device: str,
     max_new_tokens: int,
+    process_size: int | None = None,
 ) -> str:
-    """Run the model on a single page image and return the raw DocTag string."""
+    """Run the model on a single page image and return the raw DocTag string.
+
+    *process_size*, when given, is passed to the image processor as
+    ``size={"longest_edge": process_size}`` so the processor keeps the image at
+    that resolution instead of resizing to its default (longest_edge=2048).
+    Use this together with a matching pre-resize to feed the model a fixed
+    resolution (e.g. 512).
+    """
     messages = [
         {
             "role": "user",
@@ -178,11 +278,14 @@ def _infer_page(
     ]
     prompt_text = processor.apply_chat_template(messages, add_generation_prompt=True)
 
-    inputs = processor(
+    proc_kwargs = dict(
         images=image.convert("RGB"),
         text=prompt_text,
         return_tensors="pt",
     )
+    if process_size is not None:
+        proc_kwargs["size"] = {"longest_edge": process_size}
+    inputs = processor(**proc_kwargs)
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     with torch.inference_mode():
@@ -216,6 +319,7 @@ def run_inference_from_checkpoint(
     max_new_tokens: int = 9000,
     dpi: int = 96,
     max_pages: int | None = None,
+    process_size: int | None = None,
 ) -> list[dict]:
     """
     Run DocTag inference using a training checkpoint directory.
@@ -245,6 +349,7 @@ def run_inference_from_checkpoint(
         max_new_tokens=max_new_tokens,
         dpi=dpi,
         max_pages=max_pages,
+        process_size=process_size,
     )
 
 
@@ -257,6 +362,7 @@ def run_inference(
     max_new_tokens: int = 1536,  # ~8% headroom above the observed 1420-token max
     dpi: int = 96,
     max_pages: int | None = None,
+    process_size: int | None = None,
 ) -> list[dict]:
     """
     Run DocTag inference on *input_path* (image or PDF).
@@ -296,7 +402,7 @@ def run_inference(
     for i, img in enumerate(images, 1):
         print(f"Processing page {i}/{total} …", file=sys.stderr)
         t_page_start = time.time()
-        doctag = _infer_page(img, processor, model, device, max_new_tokens)
+        doctag = _infer_page(img, processor, model, device, max_new_tokens, process_size)
         t_page_end = time.time()
         elapsed = t_page_end - t_page_start
         page_times.append(elapsed)
@@ -434,6 +540,48 @@ def main() -> None:
         default=None,
         help="Maximum number of PDF pages to process (default: all pages)",
     )
+    parser.add_argument(
+        "--id_image",
+        action="store_true",
+        help=(
+            "Treat --input as an ID document image. The image is first passed through "
+            "the YOLO ID detection model; the highest-confidence detection crop is then "
+            "used for DocTag inference."
+        ),
+    )
+    parser.add_argument(
+        "--id_resize",
+        type=int,
+        default=512,
+        help=(
+            "Square edge (pixels) the YOLO-cropped ID is resized to before DocTag "
+            "inference. The processor is told to keep this resolution (size.longest_edge) "
+            "instead of upscaling to its 2048 default. Only used with --id_image "
+            "(default: 512)."
+        ),
+    )
+    parser.add_argument(
+        "--yolo_model",
+        default=DEFAULT_YOLO_MODEL_PATH,
+        help=(
+            f"Path to the YOLO model weights used for ID detection "
+            f"(default: {DEFAULT_YOLO_MODEL_PATH}). Only used with --id_image."
+        ),
+    )
+    parser.add_argument(
+        "--id_img_show",
+        action="store_true",
+        help="Show the cropped ID image after YOLO detection. Only used with --id_image."
+    )
+    parser.add_argument(
+        "--overlay_output",
+        default="id_overlay.png",
+        help=(
+            "Where to save the overlay image (YOLO ID bbox + DocTag element "
+            "boxes + Mongolian text drawn on the original oriented image). "
+            "Only produced with --id_image (default: id_overlay.png)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.checkpoint and args.model_id:
@@ -449,8 +597,33 @@ def main() -> None:
         else (torch.float16 if args.fp16 else None)
     )
 
+    # --id_image: run YOLO crop first, save to a temp file, then infer
+    input_path = args.input
+    _tmp_file = None
+    detection: dict | None = None
+    if args.id_image:
+        detection = detect_id(args.input, yolo_model_path=args.yolo_model)
+        cropped = detection["cropped"]
+        suffix = Path(args.input).suffix or ".png"
+        _tmp_file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        cropped.save(_tmp_file.name)
+
+        if args.id_img_show:
+            import cv2, numpy as np
+            cv2_img = cv2.cvtColor(np.array(cropped), cv2.COLOR_RGB2BGR)
+            max_display = 900
+            dh, dw = cv2_img.shape[:2]
+            scale = min(max_display / dw, max_display / dh, 1.0)
+            display = cv2.resize(cv2_img, (int(dw * scale), int(dh * scale)), interpolation=cv2.INTER_AREA)
+            cv2.imshow("Cropped ID", display)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+
+        _tmp_file.close()
+        input_path = _tmp_file.name
+
     common_kwargs = dict(
-        input_path=args.input,
+        input_path=input_path,
         output_path=args.output,
         device=args.device,
         dtype=dtype,
@@ -459,10 +632,27 @@ def main() -> None:
         max_pages=args.pages,
     )
 
-    if args.checkpoint:
-        run_inference_from_checkpoint(checkpoint_path=args.checkpoint, **common_kwargs)
-    else:
-        run_inference(model_id=args.model_id or DEFAULT_MODEL_ID, **common_kwargs)
+    try:
+        if args.checkpoint:
+            results = run_inference_from_checkpoint(checkpoint_path=args.checkpoint, **common_kwargs)
+        else:
+            results = run_inference(model_id=args.model_id or DEFAULT_MODEL_ID, **common_kwargs)
+    finally:
+        if _tmp_file is not None:
+            import os
+            os.unlink(_tmp_file.name)
+
+    # For ID images, draw the YOLO box, the DocTag element boxes and the
+    # Mongolian text onto the full oriented image and save it.
+    if detection is not None and results:
+        overlay = draw_doctag_overlay(
+            detection["oriented"],
+            results[0]["doctag"],
+            region=detection["crop_box"],
+            id_box=detection["id_box"],
+        )
+        overlay.save(args.overlay_output)
+        print(f"  → {args.overlay_output} (ID bbox + DocTag boxes + text overlay)")
 
 
 if __name__ == "__main__":

@@ -438,7 +438,11 @@ class DocTagLoss(nn.Module):
         device  = logits.device
 
         # Move buffers to current device (safety: handles accelerate placement)
-        token_weights = self.token_weights.to(device)
+        # Clamp token_weights to actual logits vocab size — guards against
+        # off-by-one when len(tokenizer) != model.config.vocab_size (e.g. when
+        # a checkpoint adapter added an extra special token that was never
+        # embedded into the model matrix).
+        token_weights = self.token_weights[:V].to(device)
         is_struct     = self._is_struct.to(device)
         is_loc        = self._is_loc.to(device)
         loc_ids       = self._loc_ids.to(device)
@@ -669,11 +673,15 @@ class DocTagModelWithLoss(nn.Module):
         loss_dict = self.loss_fn(logits, labels)
         total_loss = loss_dict["loss"]
 
-        # Write custom loss back into the model output object
-        # Try attribute assignment first (works for most HF ModelOutput subclasses).
+        # Write custom loss back into the model output object.
+        # ModelOutput.__setattr__ only syncs to the underlying dict when
+        # the key already exists in .keys(); since the base model was called
+        # *without* labels, outputs["loss"] is absent from the dict (None values
+        # are excluded at construction time).  Using subscript assignment
+        # (__setitem__) always updates both the dict and the Python attribute.
         try:
-            outputs.loss = total_loss
-        except (AttributeError, TypeError, FrozenInstanceError):
+            outputs["loss"] = total_loss
+        except (TypeError, AttributeError):
             # Fallback: wrap in a lightweight container that the Trainer accepts
             outputs = _DocTagOutputWrapper(
                 loss=total_loss,

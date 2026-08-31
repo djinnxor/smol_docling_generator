@@ -346,7 +346,7 @@ class DocTagDataset(Dataset):
         prompt_ids = self.processor.tokenizer(
             text_prompt,
             add_special_tokens=False,
-            truncation=True,
+            truncation=False,
             max_length=self.max_length,
         ).input_ids
 
@@ -356,7 +356,7 @@ class DocTagDataset(Dataset):
                 images=image,
                 text=text_full,
                 return_tensors="pt",
-                truncation=True,
+                truncation=False,
                 max_length=self.max_length,
             )
         except ValueError as exc:
@@ -371,7 +371,7 @@ class DocTagDataset(Dataset):
                 images=[image] * image_token_count,
                 text=text_full,
                 return_tensors="pt",
-                truncation=True,
+                truncation=False,
                 max_length=self.max_length,
             )
         finally:
@@ -897,7 +897,7 @@ def main() -> None:
     parser.add_argument(
         "--save_total_limit",
         type=int,
-        default=None,
+        default=2,
         help=(
             "Maximum number of epoch checkpoints to keep inside --output_dir. "
             "Oldest checkpoints are deleted when the limit is exceeded. "

@@ -613,11 +613,16 @@ class HomoglyphAwareLoss(torch.nn.Module):
             logits, labels, self.homoglyph_pairs, margin=self.margin
         )
 
-        # Add contrastive term to the existing loss
-        if hasattr(outputs, "loss") and outputs.loss is not None:
-            outputs.loss = outputs.loss + self.lambda_homoglyph * l_contrast
-        elif isinstance(outputs, dict) and "loss" in outputs:
+        # Add contrastive term to the existing loss.
+        # Prefer subscript assignment so ModelOutput's dict representation
+        # stays in sync with the Python attribute (see doctag_loss.py comment).
+        if isinstance(outputs, dict) and "loss" in outputs:
             outputs["loss"] = outputs["loss"] + self.lambda_homoglyph * l_contrast
+        elif hasattr(outputs, "loss") and outputs.loss is not None:
+            try:
+                outputs["loss"] = outputs.loss + self.lambda_homoglyph * l_contrast
+            except TypeError:
+                outputs.loss = outputs.loss + self.lambda_homoglyph * l_contrast
 
         return outputs
 
@@ -927,7 +932,7 @@ class DocTagDataset(Dataset):
         self,
         jsonl_path: str,
         processor,
-        max_length: int = 2048,
+        max_length: int = 300,
         native_resolution: int = 512,
         is_train: bool = True,
         aug_p: float = 0.8,
@@ -1066,33 +1071,55 @@ def preprocess_logits_for_metrics(logits, labels):
 
 def make_compute_metrics(tokenizer):
     def _compute(eval_preds):
-        predictions, labels = eval_preds
-        if isinstance(predictions, tuple):
-            predictions = predictions[0]
+        # Guard: if predictions or labels are completely absent, return safe
+        # defaults so metric_for_best_model ("otsl_row_acc") is always present
+        # and _determine_best_metric never raises a KeyError that crashes training.
+        _default = {"token_acc": 0.0, "tag_acc": 0.0, "loc_mae": 999.0,
+                    "tree_edit_dist": 999.0, "otsl_row_acc": 0.0}
+        try:
+            predictions, labels = eval_preds
+            if isinstance(predictions, tuple):
+                predictions = predictions[0]
 
-        pred_ids = np.array(predictions, dtype=np.int64)
-        mask = labels != -100
-        token_acc = float((pred_ids == labels)[mask].mean()) if mask.any() else 0.0
+            if predictions is None or labels is None:
+                return _default
 
-        pad_id = tokenizer.pad_token_id or 0
-        vocab_size = tokenizer.vocab_size or len(tokenizer)
-        labels_dec = np.clip(np.where(labels == -100, pad_id, labels), 0, vocab_size - 1)
-        preds_dec  = np.clip(pred_ids, 0, vocab_size - 1)
-        pred_strs  = tokenizer.batch_decode(preds_dec.tolist(),  skip_special_tokens=True)
-        ref_strs   = tokenizer.batch_decode(labels_dec.tolist(), skip_special_tokens=True)
+            pred_ids = np.array(predictions, dtype=np.int64)
+            if pred_ids.ndim != 2:
+                return _default
 
-        tag_acc   = float(np.mean([_tag_accuracy(p, r)     for p, r in zip(pred_strs, ref_strs)]))
-        loc_mae   = float(np.mean([_loc_mae(p, r)           for p, r in zip(pred_strs, ref_strs)]))
-        tree_edit = float(np.mean([_tree_edit_dist(p, r)    for p, r in zip(pred_strs, ref_strs)]))
-        otsl_row  = float(np.mean([_otsl_row_accuracy(p, r) for p, r in zip(pred_strs, ref_strs)]))
+            # Ensure shapes match (they should after Trainer padding, but guard anyway)
+            if pred_ids.shape != labels.shape:
+                min_len = min(pred_ids.shape[1], labels.shape[1])
+                pred_ids = pred_ids[:, :min_len]
+                labels   = labels[:,   :min_len]
 
-        return {
-            "token_acc":      token_acc,
-            "tag_acc":        tag_acc,
-            "loc_mae":        loc_mae,
-            "tree_edit_dist": tree_edit,
-            "otsl_row_acc":   otsl_row,
-        }
+            mask = labels != -100
+            token_acc = float((pred_ids == labels)[mask].mean()) if mask.any() else 0.0
+
+            pad_id = tokenizer.pad_token_id or 0
+            vocab_size = tokenizer.vocab_size or len(tokenizer)
+            labels_dec = np.clip(np.where(labels == -100, pad_id, labels), 0, vocab_size - 1)
+            preds_dec  = np.clip(pred_ids, 0, vocab_size - 1)
+            pred_strs  = tokenizer.batch_decode(preds_dec.tolist(),  skip_special_tokens=True)
+            ref_strs   = tokenizer.batch_decode(labels_dec.tolist(), skip_special_tokens=True)
+
+            tag_acc   = float(np.mean([_tag_accuracy(p, r)     for p, r in zip(pred_strs, ref_strs)]))
+            loc_mae   = float(np.mean([_loc_mae(p, r)           for p, r in zip(pred_strs, ref_strs)]))
+            tree_edit = float(np.mean([_tree_edit_dist(p, r)    for p, r in zip(pred_strs, ref_strs)]))
+            otsl_row  = float(np.mean([_otsl_row_accuracy(p, r) for p, r in zip(pred_strs, ref_strs)]))
+
+            return {
+                "token_acc":      token_acc,
+                "tag_acc":        tag_acc,
+                "loc_mae":        loc_mae,
+                "tree_edit_dist": tree_edit,
+                "otsl_row_acc":   otsl_row,
+            }
+        except Exception as exc:
+            print(f"[compute_metrics] WARNING: metrics computation failed ({exc}); "
+                  "returning defaults so training continues.")
+            return _default
     return _compute
 
 
@@ -1177,8 +1204,121 @@ def setup_vision_partial_unfreeze(
 
 
 # ===========================================================================
-# Signal handler
+# Signal handler + custom SFTTrainer
 # ===========================================================================
+
+def _unwrap_peft_model(model):
+    """
+    Walk through DocTagModelWithLoss / HomoglyphAwareLoss nn.Module wrappers
+    to find the inner PeftModel or PreTrainedModel.
+
+    Layout:
+        HomoglyphAwareLoss.model  →  DocTagModelWithLoss.base_model  →  PeftModel
+    """
+    from peft import PeftModel
+    from transformers import PreTrainedModel
+
+    visited: set = set()
+    cur = model
+    for _ in range(6):           # max nesting depth
+        if isinstance(cur, (PeftModel, PreTrainedModel)):
+            return cur
+        mid = id(cur)
+        if mid in visited:
+            break
+        visited.add(mid)
+        # HomoglyphAwareLoss uses .model; DocTagModelWithLoss uses .base_model
+        for attr in ("base_model", "model"):
+            nxt = getattr(cur, attr, None)
+            if nxt is not None and nxt is not cur:
+                cur = nxt
+                break
+        else:
+            break     # no known descent attribute, give up
+    return None
+
+
+class DocTagSFTTrainer(SFTTrainer):
+    """
+    SFTTrainer subclass that fixes checkpoint saving for weight-tied models.
+
+    Root cause
+    ----------
+    Trainer._save() checks isinstance(self.model, (PreTrainedModel, PeftModel)).
+    Our wrappers (DocTagModelWithLoss, HomoglyphAwareLoss) are plain nn.Module,
+    so the check fails and Trainer falls back to serialising the full state_dict
+    with safetensors — which raises RuntimeError because lm_head.weight and
+    embed_tokens.weight share the same storage (weight tying).
+
+    Fix
+    ---
+    Temporarily swap self.model with the inner PeftModel before calling
+    super()._save(). This makes Trainer take the correct branch that calls
+    model.save_pretrained(), which handles weight tying and saves only the
+    LoRA adapter deltas.  The original wrapper is restored afterwards.
+    """
+
+    def _save(self, output_dir=None, state_dict=None):
+        from peft import PeftModel
+        from transformers import PreTrainedModel
+
+        inner = _unwrap_peft_model(self.model)
+        if inner is not None and not isinstance(
+            self.model, (PreTrainedModel, PeftModel)
+        ):
+            original_model = self.model
+            self.model = inner
+            try:
+                super()._save(output_dir=output_dir, state_dict=state_dict)
+            finally:
+                self.model = original_model
+        else:
+            # Model is already a recognised type — use default behaviour.
+            # Still guard against the shared-tensor error as a safety net.
+            try:
+                super()._save(output_dir=output_dir, state_dict=state_dict)
+            except RuntimeError as exc:
+                if "share memory" not in str(exc):
+                    raise
+                # Last resort: clone duplicate tensors so safetensors can save
+                if state_dict is None:
+                    seen: dict = {}
+                    state_dict = {}
+                    for k, v in self.model.state_dict().items():
+                        ptr = v.data_ptr()
+                        if ptr in seen:
+                            state_dict[k] = v.detach().clone()
+                        else:
+                            seen[ptr] = k
+                            state_dict[k] = v
+                super()._save(output_dir=output_dir, state_dict=state_dict)
+
+
+def _make_eval_cleanup_callback():
+    """
+    Returns a TrainerCallback that:
+    1. Clears the CUDA cache after every evaluation pass to release
+       the memory held by the large logit tensors produced inside
+       SFTTrainer.compute_loss (outputs.logits + shift_logits copy).
+    2. Calls model.train() explicitly to ensure gradient-checkpointing
+       is restored before the next training step.
+    """
+    from transformers import TrainerCallback
+    import gc
+
+    class _EvalCleanupCallback(TrainerCallback):
+        def on_evaluate(self, args, state, control, **kwargs):
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # Re-enter train mode in case eval left the model in eval mode
+            model = kwargs.get("model")
+            if model is not None:
+                model.train()
+
+    return _EvalCleanupCallback()
+
 
 def _install_signal_handlers(trainer) -> None:
     def _handler(signum, frame):
@@ -1217,7 +1357,7 @@ def main() -> None:
     parser.add_argument("--epochs",     type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--grad_accum", type=int, default=8)
-    parser.add_argument("--max_length", type=int, default=2048)
+    parser.add_argument("--max_length", type=int, default=300)
 
     # --- Image resolution ---
     parser.add_argument("--native_resolution", type=int, default=0,
@@ -1246,6 +1386,19 @@ def main() -> None:
     parser.add_argument("--eval_steps",       type=int, default=200)
     parser.add_argument("--save_steps",       type=int, default=200)
     parser.add_argument("--save_total_limit", type=int, default=3)
+    parser.add_argument("--eval_batch_size",  type=int, default=1,
+                        help="Per-device batch size used ONLY during evaluation. "
+                             "Smaller than train batch_size avoids OOM from the "
+                             "extra logit copy (shift_logits) computed inside "
+                             "SFTTrainer.compute_loss during eval. Default: 1.")
+
+    # --- Resume ---
+    parser.add_argument("--resume_from_checkpoint", type=str, default="",
+                        help="Path to a Trainer checkpoint directory (e.g. "
+                             "doctag_model_v7/checkpoint-1000) to resume training "
+                             "from. Resumes optimizer state, scheduler, and step "
+                             "count. Use --adapter to load only LoRA weights without "
+                             "resuming the full trainer state.")
 
     # --- W&B ---
     parser.add_argument("--use_wandb",      action="store_true")
@@ -1294,6 +1447,14 @@ def main() -> None:
     parser.add_argument("--homoglyph_margin", type=float, default=2.0,
                         help="Required log-probability gap between Cyrillic and Latin "
                              "homoglyphs. 2.0 ≈ e^2 ≈ 7.4× probability ratio.")
+
+    # --- Task-specific special tokens (e.g. Mongolian ID field tags) ---
+    parser.add_argument("--extra_special_tokens", type=str, default="",
+                        help="Comma-separated special tokens to add to the tokenizer "
+                             "before training. Embeddings are resized and new rows are "
+                             "randomly initialized. Must be applied BEFORE LoRA adapter "
+                             "load so the adapter rides on the resized base embeddings. "
+                             "Example: '<register_number>,</register_number>,<gender>,...'")
 
     args = parser.parse_args()
 
@@ -1368,6 +1529,27 @@ def main() -> None:
         quantization_config=bnb_config,
     )
     model.config.use_cache = False
+
+    # -----------------------------------------------------------------------
+    # Inject task-specific special tokens BEFORE LoRA adapter load so the
+    # adapter wraps the resized base-model embeddings.  Without this, any
+    # multi-token tags silently no-op in DocTagLoss.token_weights (see
+    # doctag_loss.py build_token_weight_map — weights apply only to tokens
+    # that encode as a single ID).
+    # -----------------------------------------------------------------------
+    if args.extra_special_tokens:
+        new_toks = [t.strip() for t in args.extra_special_tokens.split(",") if t.strip()]
+        existing_vocab = set(processor.tokenizer.get_vocab().keys())
+        to_add = [t for t in new_toks if t not in existing_vocab]
+        if to_add:
+            processor.tokenizer.add_special_tokens(
+                {"additional_special_tokens": to_add}
+            )
+            model.resize_token_embeddings(len(processor.tokenizer))
+            print(f"[ExtraTokens] Added {len(to_add)} special tokens, "
+                  f"resized embeddings to {len(processor.tokenizer)}: {to_add}")
+        else:
+            print(f"[ExtraTokens] All {len(new_toks)} tokens already in vocab — no resize.")
 
     if args.qlora:
         from peft import prepare_model_for_kbit_training
@@ -1470,6 +1652,14 @@ def main() -> None:
                   else "--no_custom_loss (no logits available)")
         print(f"[HomoglyphLoss] Disabled ({reason})")
 
+    # When QLoRA is active, our nn.Module wrappers (DocTagModelWithLoss,
+    # HomoglyphAwareLoss) are not PeftModel instances, so the Transformers Trainer
+    # rejects them via isinstance() even though trainable LoRA adapters are present.
+    # Setting is_quantized=False as an instance attribute shadows __getattr__
+    # delegation and suppresses the false-positive "purely quantized model" guard.
+    if args.qlora:
+        model.is_quantized = False
+
     # -----------------------------------------------------------------------
     # Datasets — is_train flag controls augmentation; cleaning always on
     # -----------------------------------------------------------------------
@@ -1533,7 +1723,7 @@ def main() -> None:
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         warmup_ratio=0.10,
@@ -1558,12 +1748,19 @@ def main() -> None:
         eval_accumulation_steps=1,
         dataset_text_field="",
         dataset_kwargs={"skip_prepare_dataset": True},
+        # Our model wrappers (DocTagModelWithLoss, HomoglyphAwareLoss) use
+        # forward(**kwargs) with no explicit 'labels' parameter.  Without this,
+        # Transformers inspects the forward signature, finds no 'label*' param,
+        # sets label_names=[] → has_labels=False during eval → prediction_step
+        # never collects labels/logits → compute_metrics is never called →
+        # metric_for_best_model key is absent → KeyError crashes training.
+        label_names=["labels"],
     )
 
     # -----------------------------------------------------------------------
     # Trainer
     # -----------------------------------------------------------------------
-    trainer = SFTTrainer(
+    trainer = DocTagSFTTrainer(
         model=model,
         args=sft_config,
         train_dataset=train_dataset,
@@ -1572,6 +1769,7 @@ def main() -> None:
         optimizers=(optimizer, None),
         compute_metrics=make_compute_metrics(processor.tokenizer) if val_dataset else None,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics if val_dataset else None,
+        callbacks=[_make_eval_cleanup_callback()] if val_dataset else None,
     )
 
     _install_signal_handlers(trainer)
@@ -1617,8 +1815,15 @@ def main() -> None:
     # -----------------------------------------------------------------------
     print("Starting training …")
     # -----------------------------------------------------------------------
+    resume_ckpt = args.resume_from_checkpoint.strip() or None
+    if resume_ckpt:
+        if not Path(resume_ckpt).exists():
+            raise FileNotFoundError(
+                f"--resume_from_checkpoint path not found: {resume_ckpt}"
+            )
+        print(f"[Resume] Resuming from checkpoint: {resume_ckpt}")
     try:
-        trainer.train()
+        trainer.train(resume_from_checkpoint=resume_ckpt)
     except Exception as exc:
         emergency_dir = os.path.join(args.output_dir, "emergency_checkpoint")
         print(f"\n[ERROR] Training crashed: {exc}")

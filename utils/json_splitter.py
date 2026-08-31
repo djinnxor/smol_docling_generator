@@ -57,10 +57,10 @@ if __name__ == "__main__":
     # shuffle_jsonl("input.jsonl", "shuffled.jsonl", seed=42)
     # split_json_file(...)
     # To shuffle and overwrite the file:
-    # shuffle_jsonl("/home/rookie/Documents/Minje/smol_docling_generator/all_mongolian_synthetics.jsonl")
+    shuffle_jsonl("/home/rookie/Documents/Minje/smol_docling_generator/id_augmented.jsonl")
     split_json_file(
-        "/home/rookie/Documents/Minje/smol_docling_generator/all_mongolian_synthetics.jsonl",
-        "/home/rookie/Documents/Minje/smol_docling_generator/all_mongolian_synthetics_train.jsonl",
-        "/home/rookie/Documents/Minje/smol_docling_generator/all_mongolian_synthetics_val.jsonl",
+        "/home/rookie/Documents/Minje/smol_docling_generator/id_augmented.jsonl",
+        "/home/rookie/Documents/Minje/smol_docling_generator/id_augmented_train.jsonl",
+        "/home/rookie/Documents/Minje/smol_docling_generator/id_augmented_val.jsonl",
         split_ratio=0.90
     )
