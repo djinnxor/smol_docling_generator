@@ -174,7 +174,7 @@ def _tree_edit_dist(pred: str, ref: str) -> float:
             return z
 
         def _size(n):
-            return 1 + sum(_size(c) for c in n.get_children())
+            return 1 + sum(_size(c) for c in n.children)
 
         pt = _to_zss(_build(pred))
         rt = _to_zss(_build(ref))
