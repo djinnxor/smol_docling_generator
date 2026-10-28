@@ -34,7 +34,7 @@ from utils.build_document import (
 
 
 # Local folder produced by train.py --output_dir (preferred default)
-LOCAL_DOCTAG_MODEL = "doctag_model___"
+LOCAL_DOCTAG_MODEL = "doctag_restart_mixed_30___"
 # Upstream model used when the local folder is absent
 FALLBACK_MODEL_ID = "ibm-granite/granite-docling-258M"
 # Resolved default: use local folder if it exists, else HuggingFace
@@ -170,6 +170,17 @@ def _resolve_device_dtype(device: str, dtype: torch.dtype | None) -> tuple[str, 
             dtype = torch.float16
         else:
             dtype = torch.float32
+    else:
+        if device.startswith("cuda"):
+            cap = torch.cuda.get_device_capability()
+            if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+                dtype = torch.float32
+            elif dtype == torch.float16 and cap[0] < 6:
+                dtype = torch.float32
+        elif device == "cpu" and dtype in (torch.float16, torch.bfloat16):
+            dtype = torch.float32
+        elif device == "mps" and dtype == torch.bfloat16:
+            dtype = torch.float16
 
     return device, dtype
 
@@ -251,6 +262,24 @@ def _pdf_to_images(pdf_path: str, dpi: int = 150, max_pages: int | None = None) 
     return convert_from_path(pdf_path, **kwargs)
 
 
+def _resolve_render_output(render_output: str | None, page_count: int) -> tuple[str, str]:
+    """Return the visualization output path and inferred format.
+
+    If a path is supplied explicitly, its extension determines the format.
+    Otherwise the legacy default remains: PDF for multi-page output and PNG for
+    single-page output.
+    """
+    if render_output is not None:
+        path = str(render_output)
+        suffix = Path(path).suffix.lower()
+        fmt = "pdf" if suffix == ".pdf" else "png"
+        return path, fmt
+
+    default_path = "doctag_render.pdf" if page_count > 1 else "doctag_render.png"
+    fmt = "pdf" if default_path.endswith(".pdf") else "png"
+    return default_path, fmt
+
+
 def _infer_page(
     image: Image.Image,
     processor,
@@ -320,6 +349,7 @@ def run_inference_from_checkpoint(
     dpi: int = 96,
     max_pages: int | None = None,
     process_size: int | None = None,
+    render_output: str | None = None,
 ) -> list[dict]:
     """
     Run DocTag inference using a training checkpoint directory.
@@ -350,6 +380,7 @@ def run_inference_from_checkpoint(
         dpi=dpi,
         max_pages=max_pages,
         process_size=process_size,
+        render_output=render_output,
     )
 
 
@@ -363,6 +394,7 @@ def run_inference(
     dpi: int = 96,
     max_pages: int | None = None,
     process_size: int | None = None,
+    render_output: str | None = None,
 ) -> list[dict]:
     """
     Run DocTag inference on *input_path* (image or PDF).
@@ -419,11 +451,8 @@ def run_inference(
         images.append(img)
         print(f"  Page {i + 1}: {len(parse_doctag(dt))} elements")
 
-    fmt = "pdf" if len(images) > 1 else "png"
-    if fmt == "pdf":
-        written = save_output(images, "doctag_render.pdf", fmt)
-    else:
-        written = save_output(images, "doctag_render.png", fmt)
+    render_output_path, fmt = _resolve_render_output(render_output, len(images))
+    written = save_output(images, render_output_path, fmt)
     for fp in written:
         print(f"  → {fp}")
     print(f"Total inference time: {total_time:.2f} sec", file=sys.stderr)
@@ -505,6 +534,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--render_output",
+        default=None,
+        help=(
+            "Where to save the rendered DocTag visualization. "
+            "Accepts .png or .pdf. Defaults to doctag_render.png for single-page output "
+            "and doctag_render.pdf for multi-page output."
+        ),
+    )
+    parser.add_argument(
         "--device",
         default="cpu",
         help=(
@@ -525,8 +563,8 @@ def main() -> None:
     parser.add_argument(
         "--max_new_tokens",
         type=int,
-        default=9000,
-        help="Maximum number of tokens to generate per page (default: 9000)",
+        default=6000,
+        help="Maximum number of tokens to generate per page (default: 6000)",
     )
     parser.add_argument(
         "--dpi",
@@ -630,6 +668,7 @@ def main() -> None:
         max_new_tokens=args.max_new_tokens,
         dpi=args.dpi,
         max_pages=args.pages,
+        render_output=args.render_output,
     )
 
     try:

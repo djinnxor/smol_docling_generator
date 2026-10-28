@@ -65,3 +65,16 @@ doctag_model_id_resume_v6/
 doctag_model_origin_resume_5/
 id_text_enhancer/
 origin_resume_5/
+output/
+
+# Model/experiment checkpoint dirs (tracked in MLOps project, not git)
+doctag_restart_mix40_basemodel/
+doctag_restart_textonly/
+doctag_restart_mix40_textmodel/
+updated_table/
+doctag_restart_tableonly/
+doctag_restart_mix_textmodel/
+doctag_restart_mixed_Docs/
+doctag_restart_mixed_30/
+/reports
+/labels

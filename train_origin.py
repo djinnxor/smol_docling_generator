@@ -25,6 +25,7 @@ evaluation script, not against teacher-forced logits during training.
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -63,7 +64,8 @@ class DocTagDataset(Dataset):
     is computed only on the assistant's DocTag output.
     """
 
-    def __init__(self, jsonl_path: str, processor, max_length: int = 1024):
+    def __init__(self, jsonl_path: str, processor, max_length: int = 1024,
+                 image_size: int | None = None):
         self.records: list[dict] = []
         with open(jsonl_path, encoding="utf-8") as f:
             for line in f:
@@ -72,6 +74,10 @@ class DocTagDataset(Dataset):
                     self.records.append(json.loads(line))
         self.processor = processor
         self.max_length = max_length
+        # Cap the longest edge handed to the processor.  The page is split into
+        # 512px tiles, so this decides how much work the vision tower does:
+        # 2048 gives 13 tiles, 1024 gives 5.  None keeps the processor default.
+        self.image_size = image_size
 
     def __len__(self) -> int:
         return len(self.records)
@@ -79,13 +85,15 @@ class DocTagDataset(Dataset):
     def _process(self, image: Image.Image, text: str) -> dict:
         """Run the processor, repeating the page image if the chat template
         emitted more than one <image> placeholder."""
+        kw = {} if self.image_size is None else {"size": {"longest_edge": self.image_size}}
         try:
-            return self.processor(images=image, text=text, return_tensors="pt")
+            return self.processor(images=image, text=text, return_tensors="pt", **kw)
         except ValueError as exc:
             count = text.count("<image>")
             if "number of images" not in str(exc) or count <= 1:
                 raise
-            return self.processor(images=[image] * count, text=text, return_tensors="pt")
+            return self.processor(images=[image] * count, text=text,
+                                  return_tensors="pt", **kw)
 
     def __getitem__(self, idx: int) -> dict:
         record = self.records[idx]
@@ -218,6 +226,21 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate (default: 2e-5)")
     parser.add_argument("--max_length", type=int, default=2048, help="Maximum token length (default: 2048)")
+    parser.add_argument(
+        "--num_workers", type=int, default=4,
+        help="DataLoader worker processes. Image decode and the processor cost "
+             "~185ms per sample and run on the main thread when this is 0, "
+             "blocking the GPU for every one of them (default: 4)")
+    parser.add_argument(
+        "--no_grad_checkpoint", action="store_true",
+        help="Disable gradient checkpointing. It recomputes activations to save "
+             "memory and typically costs 30-40%% of step time; a 258M model with "
+             "LoRA usually does not need it")
+    parser.add_argument(
+        "--image_size", type=int, default=None,
+        help="Cap the image's longest edge before the processor tiles it into "
+             "512px patches: 2048 (the default) gives 13 tiles per page, 1536 "
+             "gives 10, 1024 gives 5. Lower is faster but loses small text")
     parser.add_argument("--fp16", action="store_true", help="Use float16 mixed precision")
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 mixed precision (recommended)")
     parser.add_argument(
@@ -239,6 +262,14 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Path to a previously trained LoRA adapter directory (must contain adapter_config.json). Loads adapter weights with a fresh optimizer.",
     )
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb_project", type=str, default="Docling finetune", help="W&B project name.")
+    parser.add_argument("--wandb_entity", type=str, default="", help="W&B entity (team or username).")
+    parser.add_argument("--wandb_run_name", type=str, default="", help="W&B run name (auto-generated if empty).")
+    parser.add_argument("--wandb_tags", type=str, default="", help="Comma-separated W&B tags.")
+    parser.add_argument("--wandb_mode", type=str, default="online",
+                        choices=["online", "offline", "disabled"],
+                        help="W&B mode: online, offline, or disabled (default: online).")
     parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
@@ -263,7 +294,7 @@ def _build_model(args: argparse.Namespace):
     )
     model = AutoModelForImageTextToText.from_pretrained(args.model_id, dtype=torch_dtype)
     # Gradient checkpointing (enabled below) is incompatible with use_cache.
-    model.config.use_cache = False
+    model.config.use_cache = bool(args.no_grad_checkpoint)
 
     if args.lora or args.lora_adapter_path:
         try:
@@ -322,20 +353,91 @@ def _resolve_checkpoint(args: argparse.Namespace) -> str | None:
     return checkpoint
 
 
+def _init_wandb(args: argparse.Namespace) -> None:
+    """Start a Weights & Biases run for the Trainer to log into.
+
+    Falls back to offline mode when the online handshake fails, so a network
+    problem never costs a training run; `wandb sync` uploads it afterwards.
+    """
+    import datetime
+    import importlib.util
+
+    if importlib.util.find_spec("wandb") is None:
+        raise ImportError("wandb is not installed. Run: pip install wandb")
+    import wandb
+
+    name = args.wandb_run_name.strip() or (
+        f"doctag-{Path(args.train_data).stem}-"
+        f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    )
+    tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()] or None
+    try:
+        wandb.init(project=args.wandb_project, entity=args.wandb_entity or None,
+                   name=name, mode=args.wandb_mode, tags=tags)
+    except Exception as exc:
+        print(f"[WARNING] wandb online init failed ({exc}). Falling back to "
+              "offline mode. Run `wandb sync` later to upload.")
+        wandb.init(project=args.wandb_project, name=name, mode="offline", tags=tags)
+
+
+
+def _build_training_args(wanted: dict) -> "TrainingArguments":
+    """Construct TrainingArguments with whatever the installed version accepts.
+
+    The argument set is not stable across transformers releases -- v5 dropped
+    several names that v4 took, and v4 renamed others -- so a script pinned to
+    one spelling dies on a machine with the other.  Rather than pin a version,
+    keep the settings that exist here and say which were dropped, so a training
+    run on a different box degrades to defaults instead of failing at startup.
+    """
+    import inspect
+
+    accepted = set(inspect.signature(TrainingArguments.__init__).parameters)
+    if "kwargs" in accepted or "self" not in accepted:
+        accepted = None                       # signature hidden behind **kwargs
+
+    if accepted is None:
+        return TrainingArguments(**wanted)
+
+    # A couple of settings were simply renamed; keep the behaviour.
+    renames = {"eval_strategy": "evaluation_strategy"}
+    usable, dropped = {}, []
+    for key, value in wanted.items():
+        if key in accepted:
+            usable[key] = value
+        elif renames.get(key) in accepted:
+            usable[renames[key]] = value
+        else:
+            dropped.append(key)
+
+    if dropped:
+        import transformers
+        print(f"NOTE: transformers {transformers.__version__} does not accept "
+              f"{', '.join(sorted(dropped))}; continuing without "
+              f"{'it' if len(dropped) == 1 else 'them'}.", file=sys.stderr)
+    return TrainingArguments(**usable)
+
+
 def _train(args: argparse.Namespace, run) -> None:
     processor, model = _build_model(args)
 
+    use_wandb = args.use_wandb and args.wandb_mode != "disabled"
+    if use_wandb:
+        _init_wandb(args)
+
     print("Building datasets …")
-    train_dataset = DocTagDataset(args.train_data, processor, args.max_length)
+    train_dataset = DocTagDataset(args.train_data, processor, args.max_length,
+                                  args.image_size)
 
     val_dataset = None
     if Path(args.val_data).exists():
-        val_dataset = DocTagDataset(args.val_data, processor, args.max_length)
+        val_dataset = DocTagDataset(args.val_data, processor, args.max_length,
+                                    args.image_size)
         print(f"Train: {len(train_dataset)} samples | Val: {len(val_dataset)} samples")
     else:
         print(f"Train: {len(train_dataset)} samples | No validation file found at {args.val_data}")
 
-    training_args = TrainingArguments(
+    wanted = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
@@ -350,13 +452,15 @@ def _train(args: argparse.Namespace, run) -> None:
         save_steps=200,
         save_total_limit=2,
         remove_unused_columns=False,
-        dataloader_num_workers=0,
+        dataloader_num_workers=args.num_workers,
+        dataloader_pin_memory=args.num_workers > 0,
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
-        gradient_checkpointing=True,
+        gradient_checkpointing=not args.no_grad_checkpoint,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        report_to="none",
+        report_to="wandb" if use_wandb else "none",
     )
+    training_args = _build_training_args(wanted)
 
     trainer = Trainer(
         model=model,

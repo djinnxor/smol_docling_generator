@@ -8,6 +8,11 @@ DocTag location tokens use a 0-500 normalised coordinate system.
 This script maps them back to absolute pixel positions and draws
 text, headers, tables, and placeholders for images.
 
+<formula> elements are typeset as equations rather than printed as source:
+LaTeX goes through matplotlib's mathtext, and a formula written with a run
+of dashes as its fraction rule is drawn as a real stacked fraction.  Pass
+--no-math to see the raw generated source instead.
+
 Supported element types:
     text, section_header_level_1/2/3, title, caption, picture,
     otsl (table), list_item, formula, page_header, page_footer,
@@ -364,6 +369,201 @@ def _draw_text_element(
         y += line_height
 
 
+# ---------------------------------------------------------------------------
+# Formula rendering
+# ---------------------------------------------------------------------------
+
+# A run of 3+ dashes is a fraction rule: the numerator sits above it and the
+# denominator below.  Scanned Mongolian accounting documents write fractions
+# that way and the OCR labels carry the dashes through literally, so drawing
+# them as a flat line of text turns a fraction into nonsense.
+_DASH_RULE_RE = re.compile(r"[-\u2013\u2014_]{3,}")
+
+# The labels carry LaTeX with doubled backslashes (\\frac, \\sum) because the
+# doctag string was JSON-escaped twice, and the model emits them the same way.
+# Collapse only a pair that introduces a command -- a bare \\ is a row break.
+_DOUBLE_ESC_RE = re.compile(r"\\\\(?=[A-Za-z,;:!])")
+
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+
+# Markers that make a string worth handing to the math typesetter.
+_MATH_HINT_RE = re.compile(r"\\[A-Za-z]+|[\^_=]")
+
+MATH_RENDERING = True    # False (or --no-math) renders formulas as plain text
+
+_MATH_DPI = 200          # typeset large, then downscale into the element box
+_MATH_FONTSIZE = 28
+# Pixels per em in the typeset bitmap -- what a point of font size is worth
+# once mathtext has rendered at _MATH_DPI.  Used to match the page's text size.
+_MATH_EM_PX = _MATH_FONTSIZE / 72 * _MATH_DPI
+_MATH_CACHE: dict[tuple[str, tuple[int, int, int]], Image.Image | None] = {}
+
+
+def normalise_latex(text: str) -> str:
+    """Undo the label double-escaping and drop any $ delimiters."""
+    return _DOUBLE_ESC_RE.sub(r"\\", text).replace("$", "").strip()
+
+
+def looks_like_math(text: str) -> bool:
+    """True when *text* is LaTeX-ish enough to be worth typesetting."""
+    if not text or _CYRILLIC_RE.search(text):
+        return False         # mathtext has no Cyrillic glyphs -- would be tofu
+    return bool(_MATH_HINT_RE.search(text))
+
+
+def render_math(
+    tex: str, colour: tuple[int, int, int] = TEXT_COLOUR
+) -> Image.Image | None:
+    """Typeset *tex* as a transparent RGBA bitmap, or None if it will not parse.
+
+    matplotlib's mathtext is used rather than a real TeX install: it covers the
+    \\frac, \\sum, \\sqrt, sub/superscript and Greek-letter vocabulary these
+    documents use, and matplotlib is already a dependency of the chart code.
+    """
+    key = (tex, colour)
+    if key in _MATH_CACHE:
+        return _MATH_CACHE[key]
+
+    image: Image.Image | None = None
+    try:
+        import io
+
+        import matplotlib
+        matplotlib.use("Agg")
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        fig = Figure(figsize=(0.01, 0.01), dpi=_MATH_DPI)
+        FigureCanvasAgg(fig)
+        fig.text(0, 0, f"${tex}$", fontsize=_MATH_FONTSIZE,
+                 color=tuple(c / 255 for c in colour))
+        buf = io.BytesIO()
+        # bbox_inches="tight" shrinks the canvas to the equation's own ink, so
+        # the caller gets a bitmap it can scale straight into the element box.
+        fig.savefig(buf, format="png", transparent=True,
+                    bbox_inches="tight", pad_inches=0.02)
+        buf.seek(0)
+        image = Image.open(buf).convert("RGBA")
+        image.load()
+    except Exception:
+        # A formula that will not parse -- a truncated generation, an
+        # unbalanced brace -- must not take the whole page down.  Returning
+        # None tells the caller to fall back to drawing the source text.
+        image = None
+
+    _MATH_CACHE[key] = image
+    return image
+
+
+def _draw_centred_lines(
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    font,
+    centre_x: int,
+    y: int,
+    line_h: int,
+    colour=TEXT_COLOUR,
+    limit_y: int | None = None,
+) -> int:
+    """Draw *lines* centred on *centre_x*, returning the y below the last one."""
+    for line in lines:
+        if limit_y is not None and y + line_h > limit_y:
+            break
+        bbox = font.getbbox(line)
+        draw.text((centre_x - (bbox[2] - bbox[0]) // 2, y), line,
+                  fill=colour, font=font)
+        y += line_h
+    return y
+
+
+def _draw_stacked_fraction(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    box: tuple[int, int, int, int],
+    font,
+    line_h: int,
+) -> None:
+    """Draw a dash-rule formula as a real fraction: num / rule / denom.
+
+    The numerator may be absent -- the labels sometimes open an element with
+    the rule because the numerator was recognised as the line above -- in
+    which case the rule is drawn at the top and everything else below it.
+    """
+    px1, py1, px2, py2 = box
+    m = _DASH_RULE_RE.search(text)
+    num = text[:m.start()].strip()
+    den = text[m.end():].strip()
+
+    box_w = max(px2 - px1, 20)
+    centre_x = px1 + box_w // 2
+    num_lines = _wrap_text(num, font, box_w) if num else []
+    den_lines = _wrap_text(den, font, box_w) if den else []
+
+    # Put the rule where the two halves meet, biased to the measured box so a
+    # fraction keeps the vertical position the model predicted for it.
+    needed = (len(num_lines) + len(den_lines)) * line_h + 6
+    top = py1 if needed <= (py2 - py1) else py1
+    rule_y = top + len(num_lines) * line_h + 2
+
+    _draw_centred_lines(draw, num_lines, font, centre_x, top, line_h)
+    draw.line([px1, rule_y, px2, rule_y], fill=TEXT_COLOUR, width=1)
+    _draw_centred_lines(draw, den_lines, font, centre_x, rule_y + 3, line_h)
+
+
+def _draw_formula(
+    img: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    elem: DocElement,
+    page_w: int,
+    page_h: int,
+    margin: int,
+) -> None:
+    """Render a <formula> element as an equation rather than as source text.
+
+    Three cases, in order: a dash-rule fraction is stacked, a LaTeX formula is
+    typeset and pasted in, and anything else falls back to the plain text path.
+    """
+    px1 = _loc_to_px(elem.x1, page_w, margin)
+    py1 = _loc_to_px(elem.y1, page_h, margin)
+    px2 = _loc_to_px(elem.x2, page_w, margin)
+    py2 = _loc_to_px(elem.y2, page_h, margin)
+    box_w, box_h = max(px2 - px1, 20), max(py2 - py1, 12)
+
+    font_size = max(8, int(FONT_SIZES["formula"] * (page_h / 1754)))
+    font = get_font(font_size)
+
+    text = re.sub(r"<loc_\d+>", "", elem.content).strip()
+    if not text:
+        return
+
+    if _DASH_RULE_RE.search(text):
+        _draw_stacked_fraction(draw, text, (px1, py1, px2, py2),
+                               font, font_size + 3)
+        return
+
+    tex = normalise_latex(text)
+    if MATH_RENDERING and looks_like_math(tex):
+        math_img = render_math(tex)
+        if math_img is not None:
+            # Scale so the equation's type size matches the page's body text
+            # rather than so the bitmap fits the box.  Predicted formula boxes
+            # hug the baseline, and a stacked fraction is two lines plus a rule
+            # tall -- squeezing that into a one-line box renders it at half the
+            # surrounding text size and unreadable.  The width is still capped
+            # to the box, because horizontal overflow would run into the
+            # neighbouring column; the extra height is centred on the box.
+            scale = min(font_size / _MATH_EM_PX, box_w / math_img.width)
+            w = max(1, int(math_img.width * scale))
+            h = max(1, int(math_img.height * scale))
+            resized = math_img.resize((w, h), Image.LANCZOS)
+            img.paste(resized,
+                      (px1 + (box_w - w) // 2, py1 + (box_h - h) // 2),
+                      resized)
+            return
+
+    _draw_text_element(draw, elem, page_w, page_h, margin)
+
+
 def _draw_picture(
     draw: ImageDraw.ImageDraw,
     elem: DocElement,
@@ -492,6 +692,8 @@ def render_doctag(
             _draw_picture(draw, elem, page_w, page_h, margin)
         elif elem.tag == "otsl":
             _draw_table(draw, elem, page_w, page_h, margin)
+        elif elem.tag == "formula":
+            _draw_formula(img, draw, elem, page_w, page_h, margin)
         else:
             _draw_text_element(draw, elem, page_w, page_h, margin)
 
@@ -519,6 +721,10 @@ def _clean_content(tag: str, content: str) -> str:
     # Drop any stray location tokens, collapse whitespace.
     text = re.sub(r"<loc_\d+>", "", content)
     text = re.sub(r"<[^>]+>", "", text)
+    if tag == "formula":
+        # The overlay labels a box with its text, so the equation cannot be
+        # typeset here -- but it can at least lose the doubled backslashes.
+        text = normalise_latex(text)
     return " ".join(text.split())
 
 
@@ -740,7 +946,15 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=DEFAULT_PAGE_W, help="Page width in px")
     parser.add_argument("--height", type=int, default=DEFAULT_PAGE_H, help="Page height in px")
     parser.add_argument("--margin", type=int, default=20, help="Page margin in px")
+    parser.add_argument(
+        "--no-math", action="store_true",
+        help="Draw <formula> elements as plain source text instead of "
+             "typesetting them (matplotlib is needed for typesetting)",
+    )
     args = parser.parse_args()
+
+    if args.no_math:
+        globals()["MATH_RENDERING"] = False
 
     # Determine format
     fmt = args.format
